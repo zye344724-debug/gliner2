@@ -1,1138 +1,277 @@
-# GLiNER2: Unified Schema-Based Information Extraction and Text Classification
+# GLiNER2 债券成交 76 字段结构化抽取
 
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![PyPI version](https://badge.fury.io/py/gliner2.svg)](https://badge.fury.io/py/gliner2)
-[![Downloads](https://pepy.tech/badge/gliner2)](https://pepy.tech/project/gliner2)
-[![Reddit](https://img.shields.io/badge/Reddit-r%2FGLiNER-FF4500?logo=reddit&logoColor=white)](https://www.reddit.com/r/GLiNER/)
-[![Discord](https://img.shields.io/badge/Discord-Join%20Community-5865F2?logo=discord&logoColor=white)](https://discord.gg/fastino)
+本仓库基于 [fastino-ai/GLiNER2](https://github.com/fastino-ai/GLiNER2) 开发，目标是从债券成交文本中抽取完整的 deal 结构。项目已将原先只覆盖 21 个高频字段的实验流程升级为完整 **76 个业务字段**的训练、校验和正式评测流程。
 
-> *Extract entities, classify text, parse structured data, and extract relations—all in one efficient model.*
+> 仓库仅包含代码、字段定义、测试和运行说明，不包含业务数据、模型权重、训练日志或检查点。
 
-GLiNER2 unifies **Named Entity Recognition**, **Text Classification**, **Structured Data Extraction**, and **Relation Extraction** into a single 205M parameter model. It provides efficient CPU-based inference without requiring complex pipelines or external API dependencies.
+## 主要改动
 
-Fine-tune via [Pioneer](https://pioneer.ai/gliner). Additional documentation via [Pioneer docs](https://agent.pioneer.ai/docs/api-reference). Join discussions on [Discord](https://discord.gg/fastino) and [Reddit](https://www.reddit.com/r/GLiNER/).
+相对于上游 GLiNER2，本仓库增加了以下能力：
 
-## ✨ Why GLiNER2?
+- 完整 76 字段 schema，定义位于 [`test/schema/deal_field_descriptions.json`](test/schema/deal_field_descriptions.json)。
+- 数据准备阶段的字段契约检查：原始字段和 schema 不一致时直接终止。
+- NER 与 Structure 训练前的全字段正例覆盖检查。
+- 严格无泄漏切分：共享 source fingerprint、fingerprint stem 或规范化文本的样本会被放入同一连通分量。
+- 训练集字段覆盖修正：只移动完整连通分量，确保全部 76 字段在训练集中都有正例。
+- 低频和易混淆字段的聚焦训练，包括买卖方向、发送方向、桥机构、双方结算、双方账户、双方交易员及不同收益率类型。
+- 三阶段服务器训练：全字段 NER 预热、Structure 聚焦训练、完整 schema 低学习率校准。
+- 正式评测默认拒绝 21 字段 core 模式，并输出逐字段 support、precision、recall 和 F1。
+- 交互式终端使用单行动态进度条；在 `nohup` 或重定向环境中自动关闭进度条，避免日志刷屏。
 
-- **🎯 One Model, Four Tasks**: Entities, classification, structured data, and relations in a single forward pass
-- **💻 CPU First**: Lightning-fast inference on standard hardware—no GPU required
-- **🛡️ Privacy**: 100% local processing, zero external dependencies
+旧的 `core_4060` 结果只评估了 21 个字段，不能作为 76 字段正式业务准确率。
 
-## 🚀 Installation & Quick Start
+## 环境要求
+
+- Python 3.8+
+- PyTorch
+- Transformers
+- PEFT
+- NVIDIA GPU 和 CUDA（正式训练推荐）
+
+安装代码及本地训练依赖：
 
 ```bash
-# Schema validation, API client, training-data utilities — no torch required
-pip install gliner2
-
-# Full local inference and training (installs torch, transformers, etc.)
-pip install gliner2[local]
+git clone https://github.com/zye344724-debug/gliner2.git
+cd gliner2
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e ".[local]"
 ```
 
-The base install gives you `Schema`, `SchemaInput`, `RegexValidator`, `GLiNER2API`,
-`InputExample`, `TrainingDataset`, and all JSONL validation tooling — everything
-needed to build schemas, validate data, and call the cloud API without pulling in
-PyTorch.
+Windows PowerShell 激活虚拟环境：
 
-To load and run models locally, install the `[local]` extra:
-
-```python
-from gliner2 import GLiNER2  # requires gliner2[local]
-
-# Load model once, use everywhere
-extractor = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
-
-# Extract entities in one line
-text = "Apple CEO Tim Cook announced iPhone 15 in Cupertino yesterday."
-result = extractor.extract_entities(text, ["company", "person", "product", "location"])
-
-print(result)
-# {'entities': {'company': ['Apple'], 'person': ['Tim Cook'], 'product': ['iPhone 15'], 'location': ['Cupertino']}}
+```powershell
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -e ".[local]"
 ```
 
-### Quantization and Compilation
+## 输入数据格式
 
-Enable fp16 and/or `torch.compile` for faster inference — no extra dependencies required.
+训练数据为 UTF-8 编码的 JSONL 文件：每行一个 JSON 对象。最小结构如下：
 
-```python
-# fp16
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1", map_location="cuda", quantize=True)
-
-# torch.compile (fused GPU kernels, first call triggers tracing)
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1", map_location="cuda", compile=True)
-
-# Both
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1", map_location="cuda", quantize=True, compile=True)
-
-# Or after loading
-model.quantize()
-model.compile()
-```
-
-### 🧭 Multi-architecture: `AutoExtractor` & the boundary architecture
-
-GLiNER2 supports two extraction architectures behind one API: the stable `span`
-architecture (`GLiNER2` / `SpanExtractor`) and an experimental `boundary`
-architecture (`BoundaryExtractor`) whose **sparse** start/end pairing supports
-spans of any length within the encoded window. `AutoExtractor.from_pretrained`
-picks the right class from the checkpoint's `architecture` field (missing/legacy
-configs default to `span`, so existing checkpoints load unchanged):
-
-```python
-from gliner2 import AutoExtractor
-
-model = AutoExtractor.from_pretrained("path/or/hub-id")  # span or boundary
-result = model.extract_entities("Apple released iPhone 15.", ["company", "product"])
-```
-
-`GLiNER2` remains fully backward compatible (`GLiNER2 = SpanExtractor` subclass).
-The boundary architecture is **experimental** and supports entities,
-classification, optional structured record/event decoding, and optional sparse
-relation extraction. Records and relations must be enabled when creating the
-boundary checkpoint. See the full guide — loading, creating/training a boundary
-model, record and relation decoding, save/load, LoRA aliases, export mode, the
-new loss/imbalance controls (`boundary_negative_weight`, `boundary_marginal_loss`,
-`classification_loss_weight`), and the gold-capacity policy
-(`TrainingConfig.on_capacity_exceeded`) — in
-[`docs/boundary_architecture.md`](docs/boundary_architecture.md).
-
-## 📦 Available Models
-
-| Model | Parameters | Description | Use Case                                         |
-|-------|------------|-------------|--------------------------------------------------|
-| `fastino/gliner2-base-v1` | 205M | base size   | Extraction / classification |
-| `fastino/gliner2-large-v1` | 340M | large size  | Extraction / classification                      |
-
-The models are available on [Hugging Face](https://huggingface.co/collections/fastino/gliner2-family).
-
-## 📚 Documentation & Tutorials
-
-Comprehensive guides for all GLiNER2 features:
-
-### Core Features
-- **[Text Classification](tutorial/1-classification.md)** - Single and multi-label classification with confidence scores
-- **[Entity Extraction](tutorial/2-ner.md)** - Named entity recognition with descriptions and spans
-- **[Structured Data Extraction](tutorial/3-json_extraction.md)** - Parse complex JSON structures from text
-- **[Combined Schemas](tutorial/4-combined.md)** - Multi-task extraction in a single pass
-- **[Regex Validators](tutorial/5-validator.md)** - Filter and validate extracted spans
-- **[Relation Extraction](tutorial/6-relation_extraction.md)** - Extract relationships between entities
-- **[API Access](tutorial/7-api.md)** - Use GLiNER2 via cloud API
-- **[Long-Context Extraction](tutorial/12-long_context.md)** - Scan long documents with overlapping chunks and global spans
-
-### Training & Customization
-- **[Training Data Format](tutorial/8-train_data.md)** - Complete guide to preparing training data
-- **[Model Training](tutorial/9-training.md)** - Train custom models for your domain
-- **[LoRA Adapters](tutorial/10-lora_adapters.md)** - Parameter-efficient fine-tuning
-- **[Adapter Switching](tutorial/11-adapter_switching.md)** - Switch between domain adapters
-
-## 🎯 Core Capabilities
-
-### 1. Entity Extraction
-Extract named entities with optional descriptions for precision:
-
-```python
-# Basic entity extraction
-entities = extractor.extract_entities(
-    "Patient received 400mg ibuprofen for severe headache at 2 PM.",
-    ["medication", "dosage", "symptom", "time"]
-)
-# Output: {'entities': {'medication': ['ibuprofen'], 'dosage': ['400mg'], 'symptom': ['severe headache'], 'time': ['2 PM']}}
-
-# Enhanced with descriptions for medical accuracy
-entities = extractor.extract_entities(
-    "Patient received 400mg ibuprofen for severe headache at 2 PM.",
-    {
-        "medication": "Names of drugs, medications, or pharmaceutical substances",
-        "dosage": "Specific amounts like '400mg', '2 tablets', or '5ml'",
-        "symptom": "Medical symptoms, conditions, or patient complaints",
-        "time": "Time references like '2 PM', 'morning', or 'after lunch'"
-    }
-)
-# Same output but with higher accuracy due to context descriptions
-
-# With confidence scores
-entities = extractor.extract_entities(
-    "Apple Inc. CEO Tim Cook announced iPhone 15 in Cupertino.",
-    ["company", "person", "product", "location"],
-    include_confidence=True
-)
-# Output: {
-#     'entities': {
-#         'company': [{'text': 'Apple Inc.', 'confidence': 0.95}],
-#         'person': [{'text': 'Tim Cook', 'confidence': 0.92}],
-#         'product': [{'text': 'iPhone 15', 'confidence': 0.88}],
-#         'location': [{'text': 'Cupertino', 'confidence': 0.90}]
-#     }
-# }
-
-# With character positions (spans)
-entities = extractor.extract_entities(
-    "Apple Inc. CEO Tim Cook announced iPhone 15 in Cupertino.",
-    ["company", "person", "product"],
-    include_spans=True
-)
-# Output: {
-#     'entities': {
-#         'company': [{'text': 'Apple Inc.', 'start': 0, 'end': 9}],
-#         'person': [{'text': 'Tim Cook', 'start': 15, 'end': 23}],
-#         'product': [{'text': 'iPhone 15', 'start': 35, 'end': 44}]
-#     }
-# }
-
-# With both confidence and spans
-entities = extractor.extract_entities(
-    "Apple Inc. CEO Tim Cook announced iPhone 15 in Cupertino.",
-    ["company", "person", "product"],
-    include_confidence=True,
-    include_spans=True
-)
-# Output: {
-#     'entities': {
-#         'company': [{'text': 'Apple Inc.', 'confidence': 0.95, 'start': 0, 'end': 9}],
-#         'person': [{'text': 'Tim Cook', 'confidence': 0.92, 'start': 15, 'end': 23}],
-#         'product': [{'text': 'iPhone 15', 'confidence': 0.88, 'start': 35, 'end': 44}]
-#     }
-# }
-```
-
-### Long-Document Extraction
-Use the explicit long-document APIs when input text is longer than the model's
-normal context window. GLiNER2 scans overlapping word chunks, remaps chunk-local
-spans back to the original document, and merges duplicate detections from the
-overlap.
-
-```python
-long_text = open("annual_report.txt").read()
-
-result = extractor.extract_entities_long(
-    long_text,
-    ["company", "person", "product", "location"],
-    chunk_size=384,
-    chunk_overlap=64,
-    include_spans=True,
-    include_confidence=True,
-)
-
-# Spans are global offsets into long_text.
-for company in result["entities"].get("company", []):
-    assert long_text[company["start"]:company["end"]] == company["text"]
-```
-
-For multiple documents, use `batch_extract_entities_long(...)` or the generic
-`batch_extract_long(...)` with a schema. Increase `chunk_overlap` when important
-entities or relations may appear near chunk boundaries.
-
-### 2. Text Classification
-Single or multi-label classification with configurable confidence:
-
-```python
-# Sentiment analysis
-result = extractor.classify_text(
-    "This laptop has amazing performance but terrible battery life!",
-    {"sentiment": ["positive", "negative", "neutral"]}
-)
-# Output: {'sentiment': 'negative'}
-
-# Multi-aspect classification
-result = extractor.classify_text(
-    "Great camera quality, decent performance, but poor battery life.",
-    {
-        "aspects": {
-            "labels": ["camera", "performance", "battery", "display", "price"],
-            "multi_label": True,
-            "cls_threshold": 0.4
+```json
+{
+  "input": "240001 1000 买方机构 出给 卖方机构",
+  "output": {
+    "json_structures": [
+      {
+        "deal": {
+          "bond_code": {"text": "240001", "start": 0, "end": 6},
+          "volume": {"text": "1000", "start": 7, "end": 11},
+          "buyer": {"text": "买方机构", "start": 12, "end": 16},
+          "seller": {"text": "卖方机构", "start": 20, "end": 24}
         }
-    }
-)
-# Output: {'aspects': ['camera', 'performance', 'battery']}
-
-# With confidence scores
-result = extractor.classify_text(
-    "This laptop has amazing performance but terrible battery life!",
-    {"sentiment": ["positive", "negative", "neutral"]},
-    include_confidence=True
-)
-# Output: {'sentiment': {'label': 'negative', 'confidence': 0.82}}
-
-# Multi-label with confidence
-schema = extractor.create_schema().classification(
-    "topics",
-    ["technology", "business", "health", "politics", "sports"],
-    multi_label=True,
-    cls_threshold=0.3
-)
-text = "Apple announced new health monitoring features in their latest smartwatch, boosting their stock price."
-results = extractor.extract(text, schema, include_confidence=True)
-# Output: {
-#     'topics': [
-#         {'label': 'technology', 'confidence': 0.92},
-#         {'label': 'business', 'confidence': 0.78},
-#         {'label': 'health', 'confidence': 0.65}
-#     ]
-# }
-```
-
-### 3. Structured Data Extraction
-Parse complex structured information with field-level control:
-
-```python
-# Product information extraction
-text = "iPhone 15 Pro Max with 256GB storage, A17 Pro chip, priced at $1199. Available in titanium and black colors."
-
-result = extractor.extract_json(
-    text,
-    {
-        "product": [
-            "name::str::Full product name and model",
-            "storage::str::Storage capacity like 256GB or 1TB", 
-            "processor::str::Chip or processor information",
-            "price::str::Product price with currency",
-            "colors::list::Available color options"
-        ]
-    }
-)
-# Output: {
-#     'product': [{
-#         'name': 'iPhone 15 Pro Max',
-#         'storage': '256GB', 
-#         'processor': 'A17 Pro chip',
-#         'price': '$1199',
-#         'colors': ['titanium', 'black']
-#     }]
-# }
-
-# Multiple structured entities
-text = "Apple Inc. headquarters in Cupertino launched iPhone 15 for $999 and MacBook Air for $1299."
-
-result = extractor.extract_json(
-    text,
-    {
-        "company": [
-            "name::str::Company name",
-            "location::str::Company headquarters or office location"
-        ],
-        "products": [
-            "name::str::Product name and model",
-            "price::str::Product retail price"
-        ]
-    }
-)
-# Output: {
-#     'company': [{'name': 'Apple Inc.', 'location': 'Cupertino'}],
-#     'products': [
-#         {'name': 'iPhone 15', 'price': '$999'},
-#         {'name': 'MacBook Air', 'price': '$1299'}
-#     ]
-# }
-
-# With confidence scores
-result = extractor.extract_json(
-    "The MacBook Pro costs $1999 and features M3 chip, 16GB RAM, and 512GB storage.",
-    {
-        "product": [
-            "name::str",
-            "price",
-            "features"
-        ]
-    },
-    include_confidence=True
-)
-# Output: {
-#     'product': [{
-#         'name': {'text': 'MacBook Pro', 'confidence': 0.95},
-#         'price': [{'text': '$1999', 'confidence': 0.92}],
-#         'features': [
-#             {'text': 'M3 chip', 'confidence': 0.88},
-#             {'text': '16GB RAM', 'confidence': 0.90},
-#             {'text': '512GB storage', 'confidence': 0.87}
-#         ]
-#     }]
-# }
-
-# With character positions (spans)
-result = extractor.extract_json(
-    "The MacBook Pro costs $1999 and features M3 chip.",
-    {
-        "product": [
-            "name::str",
-            "price"
-        ]
-    },
-    include_spans=True
-)
-# Output: {
-#     'product': [{
-#         'name': {'text': 'MacBook Pro', 'start': 4, 'end': 15},
-#         'price': [{'text': '$1999', 'start': 22, 'end': 27}]
-#     }]
-# }
-
-# With both confidence and spans
-result = extractor.extract_json(
-    "The MacBook Pro costs $1999 and features M3 chip, 16GB RAM, and 512GB storage.",
-    {
-        "product": [
-            "name::str",
-            "price",
-            "features"
-        ]
-    },
-    include_confidence=True,
-    include_spans=True
-)
-# Output: {
-#     'product': [{
-#         'name': {'text': 'MacBook Pro', 'confidence': 0.95, 'start': 4, 'end': 15},
-#         'price': [{'text': '$1999', 'confidence': 0.92, 'start': 22, 'end': 27}],
-#         'features': [
-#             {'text': 'M3 chip', 'confidence': 0.88, 'start': 32, 'end': 39},
-#             {'text': '16GB RAM', 'confidence': 0.90, 'start': 41, 'end': 49},
-#             {'text': '512GB storage', 'confidence': 0.87, 'start': 55, 'end': 68}
-#         ]
-#     }]
-# }
-```
-
-### 4. Relation Extraction
-Extract relationships between entities as directional tuples:
-
-```python
-# Basic relation extraction
-text = "John works for Apple Inc. and lives in San Francisco. Apple Inc. is located in Cupertino."
-
-result = extractor.extract_relations(
-    text,
-    ["works_for", "lives_in", "located_in"]
-)
-# Output: {
-#     'relation_extraction': {
-#         'works_for': [('John', 'Apple Inc.')],
-#         'lives_in': [('John', 'San Francisco')],
-#         'located_in': [('Apple Inc.', 'Cupertino')]
-#     }
-# }
-
-# With descriptions for better accuracy
-schema = extractor.create_schema().relations({
-    "works_for": "Employment relationship where person works at organization",
-    "founded": "Founding relationship where person created organization",
-    "acquired": "Acquisition relationship where company bought another company",
-    "located_in": "Geographic relationship where entity is in a location"
-})
-
-text = "Elon Musk founded SpaceX in 2002. SpaceX is located in Hawthorne, California."
-results = extractor.extract(text, schema)
-# Output: {
-#     'relation_extraction': {
-#         'founded': [('Elon Musk', 'SpaceX')],
-#         'located_in': [('SpaceX', 'Hawthorne, California')]
-#     }
-# }
-
-# With confidence scores
-results = extractor.extract_relations(
-    "John works for Apple Inc. and lives in San Francisco.",
-    ["works_for", "lives_in"],
-    include_confidence=True
-)
-# Output: {
-#     'relation_extraction': {
-#         'works_for': [{
-#             'head': {'text': 'John', 'confidence': 0.95},
-#             'tail': {'text': 'Apple Inc.', 'confidence': 0.92}
-#         }],
-#         'lives_in': [{
-#             'head': {'text': 'John', 'confidence': 0.94},
-#             'tail': {'text': 'San Francisco', 'confidence': 0.91}
-#         }]
-#     }
-# }
-
-# With character positions (spans)
-results = extractor.extract_relations(
-    "John works for Apple Inc. and lives in San Francisco.",
-    ["works_for", "lives_in"],
-    include_spans=True
-)
-# Output: {
-#     'relation_extraction': {
-#         'works_for': [{
-#             'head': {'text': 'John', 'start': 0, 'end': 4},
-#             'tail': {'text': 'Apple Inc.', 'start': 15, 'end': 25}
-#         }],
-#         'lives_in': [{
-#             'head': {'text': 'John', 'start': 0, 'end': 4},
-#             'tail': {'text': 'San Francisco', 'start': 33, 'end': 46}
-#         }]
-#     }
-# }
-
-# With both confidence and spans
-results = extractor.extract_relations(
-    "John works for Apple Inc. and lives in San Francisco.",
-    ["works_for", "lives_in"],
-    include_confidence=True,
-    include_spans=True
-)
-# Output: {
-#     'relation_extraction': {
-#         'works_for': [{
-#             'head': {'text': 'John', 'confidence': 0.95, 'start': 0, 'end': 4},
-#             'tail': {'text': 'Apple Inc.', 'confidence': 0.92, 'start': 15, 'end': 25}
-#         }],
-#         'lives_in': [{
-#             'head': {'text': 'John', 'confidence': 0.94, 'start': 0, 'end': 4},
-#             'tail': {'text': 'San Francisco', 'confidence': 0.91, 'start': 33, 'end': 46}
-#         }]
-#     }
-# }
-```
-
-### 5. Multi-Task Schema Composition
-Combine all extraction types when you need comprehensive analysis:
-
-```python
-# Use create_schema() for multi-task scenarios
-schema = (extractor.create_schema()
-    # Extract key entities
-    .entities({
-        "person": "Names of people, executives, or individuals",
-        "company": "Organization, corporation, or business names", 
-        "product": "Products, services, or offerings mentioned"
-    })
-    
-    # Classify the content
-    .classification("sentiment", ["positive", "negative", "neutral"])
-    .classification("category", ["technology", "business", "finance", "healthcare"])
-    
-    # Extract relationships
-    .relations(["works_for", "founded", "located_in"])
-    
-    # Extract structured product details
-    .structure("product_info")
-        .field("name", dtype="str")
-        .field("price", dtype="str")
-        .field("features", dtype="list")
-        .field("availability", dtype="str", choices=["in_stock", "pre_order", "sold_out"])
-)
-
-# Comprehensive extraction in one pass
-text = "Apple CEO Tim Cook unveiled the revolutionary iPhone 15 Pro for $999. The device features an A17 Pro chip and titanium design. Tim Cook works for Apple, which is located in Cupertino."
-
-results = extractor.extract(text, schema)
-# Output: {
-#     'entities': {
-#         'person': ['Tim Cook'], 
-#         'company': ['Apple'], 
-#         'product': ['iPhone 15 Pro']
-#     },
-#     'sentiment': 'positive',
-#     'category': 'technology',
-#     'relation_extraction': {
-#         'works_for': [('Tim Cook', 'Apple')],
-#         'located_in': [('Apple', 'Cupertino')]
-#     },
-#     'product_info': [{
-#         'name': 'iPhone 15 Pro',
-#         'price': '$999',
-#         'features': ['A17 Pro chip', 'titanium design'],
-#         'availability': 'in_stock'
-#     }]
-# }
-```
-
-## 🏭 Example Usage Scenarios
-
-### Financial Document Processing
-
-```python
-financial_text = """
-Transaction Report: Goldman Sachs processed a $2.5M equity trade for Tesla Inc. 
-on March 15, 2024. Commission: $1,250. Status: Completed.
-"""
-
-# Extract structured financial data
-result = extractor.extract_json(
-    financial_text,
-    {
-        "transaction": [
-            "broker::str::Financial institution or brokerage firm",
-            "amount::str::Transaction amount with currency",
-            "security::str::Stock, bond, or financial instrument",
-            "date::str::Transaction date",
-            "commission::str::Fees or commission charged", 
-            "status::str::Transaction status",
-            "type::[equity|bond|option|future|forex]::str::Type of financial instrument"
-        ]
-    }
-)
-# Output: {
-#     'transaction': [{
-#         'broker': 'Goldman Sachs',
-#         'amount': '$2.5M', 
-#         'security': 'Tesla Inc.',
-#         'date': 'March 15, 2024',
-#         'commission': '$1,250',
-#         'status': 'Completed',
-#         'type': 'equity'
-#     }]
-# }
-```
-
-### Healthcare Information Extraction
-
-```python
-medical_record = """
-Patient: Sarah Johnson, 34, presented with acute chest pain and shortness of breath.
-Prescribed: Lisinopril 10mg daily, Metoprolol 25mg twice daily.
-Follow-up scheduled for next Tuesday.
-"""
-
-result = extractor.extract_json(
-    medical_record,
-    {
-        "patient_info": [
-            "name::str::Patient full name",
-            "age::str::Patient age",
-            "symptoms::list::Reported symptoms or complaints"
-        ],
-        "prescriptions": [
-            "medication::str::Drug or medication name",
-            "dosage::str::Dosage amount and frequency",
-            "frequency::str::How often to take the medication"
-        ]
-    }
-)
-# Output: {
-#     'patient_info': [{
-#         'name': 'Sarah Johnson',
-#         'age': '34',
-#         'symptoms': ['acute chest pain', 'shortness of breath']
-#     }],
-#     'prescriptions': [
-#         {'medication': 'Lisinopril', 'dosage': '10mg', 'frequency': 'daily'},
-#         {'medication': 'Metoprolol', 'dosage': '25mg', 'frequency': 'twice daily'}
-#     ]
-# }
-```
-
-### Legal Contract Analysis
-
-```python
-contract_text = """
-Service Agreement between TechCorp LLC and DataSystems Inc., effective January 1, 2024.
-Monthly fee: $15,000. Contract term: 24 months with automatic renewal.
-Termination clause: 30-day written notice required.
-"""
-
-# Multi-task extraction for comprehensive analysis
-schema = (extractor.create_schema()
-    .entities(["company", "date", "duration", "fee"])
-    .classification("contract_type", ["service", "employment", "nda", "partnership"])
-    .relations(["signed_by", "involves", "dated"])
-    .structure("contract_terms")
-        .field("parties", dtype="list")
-        .field("effective_date", dtype="str")
-        .field("monthly_fee", dtype="str")
-        .field("term_length", dtype="str")
-        .field("renewal", dtype="str", choices=["automatic", "manual", "none"])
-        .field("termination_notice", dtype="str")
-)
-
-results = extractor.extract(contract_text, schema)
-# Output: {
-#     'entities': {
-#         'company': ['TechCorp LLC', 'DataSystems Inc.'],
-#         'date': ['January 1, 2024'],
-#         'duration': ['24 months'],
-#         'fee': ['$15,000']
-#     },
-#     'contract_type': 'service',
-#     'relation_extraction': {
-#         'involves': [('TechCorp LLC', 'DataSystems Inc.')],
-#         'dated': [('Service Agreement', 'January 1, 2024')]
-#     },
-#     'contract_terms': [{
-#         'parties': ['TechCorp LLC', 'DataSystems Inc.'],
-#         'effective_date': 'January 1, 2024',
-#         'monthly_fee': '$15,000',
-#         'term_length': '24 months', 
-#         'renewal': 'automatic',
-#         'termination_notice': '30-day written notice'
-#     }]
-# }
-```
-
-### Knowledge Graph Construction
-
-```python
-# Extract entities and relations for knowledge graph building
-text = """
-Elon Musk founded SpaceX in 2002. SpaceX is located in Hawthorne, California.
-SpaceX acquired Swarm Technologies in 2021. Many engineers work for SpaceX.
-"""
-
-schema = (extractor.create_schema()
-    .entities(["person", "organization", "location", "date"])
-    .relations({
-        "founded": "Founding relationship where person created organization",
-        "acquired": "Acquisition relationship where company bought another company",
-        "located_in": "Geographic relationship where entity is in a location",
-        "works_for": "Employment relationship where person works at organization"
-    })
-)
-
-results = extractor.extract(text, schema)
-# Output: {
-#     'entities': {
-#         'person': ['Elon Musk', 'engineers'],
-#         'organization': ['SpaceX', 'Swarm Technologies'],
-#         'location': ['Hawthorne, California'],
-#         'date': ['2002', '2021']
-#     },
-#     'relation_extraction': {
-#         'founded': [('Elon Musk', 'SpaceX')],
-#         'acquired': [('SpaceX', 'Swarm Technologies')],
-#         'located_in': [('SpaceX', 'Hawthorne, California')],
-#         'works_for': [('engineers', 'SpaceX')]
-#     }
-# }
-```
-
-## ⚙️ Advanced Configuration
-
-### Custom Confidence Thresholds
-
-```python
-# High-precision extraction for critical fields
-result = extractor.extract_json(
-    text,
-    {
-        "financial_data": [
-            "account_number::str::Bank account number",  # default threshold
-            "amount::str::Transaction amount",           # default threshold  
-            "routing_number::str::Bank routing number"   # default threshold
-        ]
-    },
-    threshold=0.9  # High confidence for all fields
-)
-
-# Per-field thresholds using schema builder (for multi-task scenarios)
-schema = (extractor.create_schema()
-    .structure("sensitive_data")
-        .field("ssn", dtype="str", threshold=0.95)         # Highest precision
-        .field("email", dtype="str", threshold=0.8)        # Medium precision  
-        .field("phone", dtype="str", threshold=0.7)        # Lower precision
-)
-```
-
-### Field Types and Constraints
-
-```python
-# Structured extraction with choices and types
-result = extractor.extract_json(
-    "Premium subscription at $99/month with mobile and web access.",
-    {
-        "subscription": [
-            "tier::[basic|premium|enterprise]::str::Subscription level",
-            "price::str::Monthly or annual cost",
-            "billing::[monthly|annual]::str::Billing frequency", 
-            "features::[mobile|web|api|analytics]::list::Included features"
-        ]
-    }
-)
-# Output: {
-#     'subscription': [{
-#         'tier': 'premium',
-#         'price': '$99/month', 
-#         'billing': 'monthly',
-#         'features': ['mobile', 'web']
-#     }]
-# }
-```
-
-## 🔍 Regex Validators
-
-Filter extracted spans to ensure they match expected patterns, improving extraction quality and reducing false positives.
-
-```python
-from gliner2 import GLiNER2, RegexValidator
-
-extractor = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
-
-# Email validation
-email_validator = RegexValidator(r"^[\w\.-]+@[\w\.-]+\.\w+$")
-schema = (extractor.create_schema()
-    .structure("contact")
-        .field("email", dtype="str", validators=[email_validator])
-)
-
-text = "Contact: john@company.com, not-an-email, jane@domain.org"
-results = extractor.extract(text, schema)
-# Output: {'contact': [{'email': 'john@company.com'}]}  # Only valid emails
-
-# Phone number validation (US format)
-phone_validator = RegexValidator(r"\(\d{3}\)\s\d{3}-\d{4}", mode="partial")
-schema = (extractor.create_schema()
-    .structure("contact")
-        .field("phone", dtype="str", validators=[phone_validator])
-)
-
-text = "Call (555) 123-4567 or 5551234567"
-results = extractor.extract(text, schema)
-# Output: {'contact': [{'phone': '(555) 123-4567'}]}  # Second number filtered out
-
-# URL validation
-url_validator = RegexValidator(r"^https?://", mode="partial")
-schema = (extractor.create_schema()
-    .structure("links")
-        .field("url", dtype="list", validators=[url_validator])
-)
-
-text = "Visit https://example.com or www.site.com"
-results = extractor.extract(text, schema)
-# Output: {'links': [{'url': ['https://example.com']}]}  # www.site.com filtered out
-
-# Exclude test data
-import re
-no_test_validator = RegexValidator(r"^(test|demo|sample)", exclude=True, flags=re.IGNORECASE)
-schema = (extractor.create_schema()
-    .structure("products")
-        .field("name", dtype="list", validators=[no_test_validator])
-)
-
-text = "Products: iPhone, Test Phone, Samsung Galaxy"
-results = extractor.extract(text, schema)
-# Output: {'products': [{'name': ['iPhone', 'Samsung Galaxy']}]}  # Test Phone excluded
-
-# Multiple validators (all must pass)
-username_validators = [
-    RegexValidator(r"^[a-zA-Z0-9_]+$"),  # Alphanumeric + underscore
-    RegexValidator(r"^.{3,20}$"),        # 3-20 characters
-    RegexValidator(r"^(?!admin)", exclude=True, flags=re.IGNORECASE)  # No "admin"
-]
-
-schema = (extractor.create_schema()
-    .structure("user")
-        .field("username", dtype="str", validators=username_validators)
-)
-
-text = "Users: ab, john_doe, user@domain, admin, valid_user123"
-results = extractor.extract(text, schema)
-# Output: {'user': [{'username': 'john_doe'}]}  # Only valid usernames
-```
-
-## FlashDeberta (Optional GPU Acceleration)
-
-For DebertaV2-based models, you can use [FlashDeberta](https://github.com/fastino-ai/flashdeberta) to accelerate inference on GPU via flash attention kernels.
-
-**Install:**
-
-```bash
-pip install flashdeberta
-```
-
-**Use:**
-
-```python
-import os
-os.environ["USE_FLASHDEBERTA"] = "1"  # set before importing gliner2
-
-from gliner2 import GLiNER2
-
-extractor = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
-# Prints: "Using FlashDeberta backend."
-
-result = extractor.extract_entities(
-    "Apple CEO Tim Cook announced iPhone 15 in Cupertino.",
-    ["company", "person", "product", "location"]
-)
-```
-
-The flag is only effective when the model uses a DebertaV2 encoder and the `flashdeberta` package is installed. Otherwise standard HuggingFace `AutoModel` is used automatically.
-
-A benchmark script is included to compare the two backends:
-
-```bash
-python benchmarks/benchmark_flashdeberta.py
-```
-
-## 📦 Batch Processing
-
-Process multiple texts efficiently in a single call:
-
-```python
-# Batch entity extraction
-texts = [
-    "Google's Sundar Pichai unveiled Gemini AI in Mountain View.",
-    "Microsoft CEO Satya Nadella announced Copilot at Build 2023.",
-    "Amazon's Andy Jassy revealed new AWS services in Seattle."
-]
-
-results = extractor.batch_extract_entities(
-    texts,
-    ["company", "person", "product", "location"],
-    batch_size=8
-)
-# Returns list of results, one per input text
-
-# Batch relation extraction
-texts = [
-    "John works for Microsoft and lives in Seattle.",
-    "Sarah founded TechStartup in 2020.",
-    "Bob reports to Alice at Google."
-]
-
-results = extractor.batch_extract_relations(
-    texts,
-    ["works_for", "founded", "reports_to", "lives_in"],
-    batch_size=8
-)
-# Returns list of relation extraction results for each text
-# All requested relation types appear in each result, even if empty
-
-# Batch with confidence and spans
-results = extractor.batch_extract_entities(
-    texts,
-    ["company", "person"],
-    include_confidence=True,
-    include_spans=True,
-    batch_size=8
-)
-```
-
-## 🎓 Training Custom Models
-
-Train GLiNER2 on your own data to specialize for your domain or use case.
-
-### Quick Start Training
-
-```python
-from gliner2 import GLiNER2
-from gliner2.training.data import InputExample
-from gliner2.training.trainer import GLiNER2Trainer, TrainingConfig
-
-# 1. Prepare training data
-examples = [
-    InputExample(
-        text="John works at Google in California.",
-        entities={"person": ["John"], "company": ["Google"], "location": ["California"]}
-    ),
-    InputExample(
-        text="Apple released iPhone 15.",
-        entities={"company": ["Apple"], "product": ["iPhone 15"]}
-    ),
-    # Add more examples...
-]
-
-# 2. Configure training
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
-config = TrainingConfig(
-    output_dir="./output",
-    num_epochs=10,
-    batch_size=8,
-    encoder_lr=1e-5,
-    task_lr=5e-4
-)
-
-# 3. Train
-trainer = GLiNER2Trainer(model, config)
-trainer.train(train_data=examples)
-```
-
-### Training Data Format (JSONL)
-
-GLiNER2 uses JSONL format where each line contains an `input` and `output` field:
-
-```jsonl
-{"input": "Tim Cook is the CEO of Apple Inc., based in Cupertino, California.", "output": {"entities": {"person": ["Tim Cook"], "company": ["Apple Inc."], "location": ["Cupertino", "California"]}, "entity_descriptions": {"person": "Full name of a person", "company": "Business organization name", "location": "Geographic location or place"}}}
-{"input": "OpenAI released GPT-4 in March 2023.", "output": {"entities": {"company": ["OpenAI"], "model": ["GPT-4"], "date": ["March 2023"]}}}
-```
-
-**Classification Example:**
-```jsonl
-{"input": "This movie is absolutely fantastic! I loved every minute of it.", "output": {"classifications": [{"task": "sentiment", "labels": ["positive", "negative", "neutral"], "true_label": ["positive"]}]}}
-{"input": "The service was terrible and the food was cold.", "output": {"classifications": [{"task": "sentiment", "labels": ["positive", "negative", "neutral"], "true_label": ["negative"]}]}}
-```
-
-**Structured Extraction Example:**
-```jsonl
-{"input": "iPhone 15 Pro Max with 256GB storage, priced at $1199.", "output": {"json_structures": [{"product": {"name": "iPhone 15 Pro Max", "storage": "256GB", "price": "$1199"}}]}}
-```
-
-**Relation Extraction Example:**
-```jsonl
-{"input": "John works for Apple Inc. and lives in San Francisco.", "output": {"relations": [{"works_for": {"head": "John", "tail": "Apple Inc."}}, {"lives_in": {"head": "John", "tail": "San Francisco"}}]}}
-```
-
-### Training from JSONL File
-
-```python
-from gliner2 import GLiNER2
-from gliner2.training.trainer import GLiNER2Trainer, TrainingConfig
-
-# Load model and train from JSONL file
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
-config = TrainingConfig(output_dir="./output", num_epochs=10)
-
-trainer = GLiNER2Trainer(model, config)
-trainer.train(train_data="train.jsonl")  # Path to your JSONL file
-```
-
-### LoRA Training (Parameter-Efficient Fine-Tuning)
-
-Train lightweight adapters for domain-specific tasks:
-
-```python
-from gliner2 import GLiNER2
-from gliner2.training.data import InputExample
-from gliner2.training.trainer import GLiNER2Trainer, TrainingConfig
-
-# Prepare domain-specific data
-legal_examples = [
-    InputExample(
-        text="Apple Inc. filed a lawsuit against Samsung Electronics.",
-        entities={"company": ["Apple Inc.", "Samsung Electronics"]}
-    ),
-    # Add more examples...
-]
-
-# Configure LoRA training
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
-config = TrainingConfig(
-    output_dir="./legal_adapter",
-    num_epochs=10,
-    batch_size=8,
-    encoder_lr=1e-5,
-    task_lr=5e-4,
-    
-    # LoRA settings
-    use_lora=True,                    # Enable LoRA
-    lora_r=8,                         # Rank (4, 8, 16, 32)
-    lora_alpha=16.0,                  # Scaling factor (usually 2*r)
-    lora_dropout=0.0,                 # Dropout for LoRA layers
-    save_adapter_only=True            # Save only adapter (~5MB vs ~450MB)
-)
-
-# Train adapter
-trainer = GLiNER2Trainer(model, config)
-trainer.train(train_data=legal_examples)
-
-# Use the adapter
-model.load_adapter("./legal_adapter/final")
-results = model.extract_entities(legal_text, ["company", "law"])
-```
-
-**Benefits of LoRA:**
-- **Smaller size**: Adapters are ~2-10 MB vs ~450 MB for full models
-- **Faster training**: 2-3x faster than full fine-tuning
-- **Easy switching**: Swap adapters in milliseconds for different domains
-
-### Complete Training Example
-
-```python
-from gliner2 import GLiNER2
-from gliner2.training.data import InputExample, TrainingDataset
-from gliner2.training.trainer import GLiNER2Trainer, TrainingConfig
-
-# Prepare training data
-train_examples = [
-    InputExample(
-        text="Tim Cook is the CEO of Apple Inc., based in Cupertino, California.",
-        entities={
-            "person": ["Tim Cook"],
-            "company": ["Apple Inc."],
-            "location": ["Cupertino", "California"]
-        },
-        entity_descriptions={
-            "person": "Full name of a person",
-            "company": "Business organization name",
-            "location": "Geographic location or place"
-        }
-    ),
-    # Add more examples...
-]
-
-# Create and validate dataset
-train_dataset = TrainingDataset(train_examples)
-train_dataset.validate(strict=True, raise_on_error=True)
-train_dataset.print_stats()
-
-# Split into train/validation
-train_data, val_data, _ = train_dataset.split(
-    train_ratio=0.8,
-    val_ratio=0.2,
-    test_ratio=0.0,
-    shuffle=True,
-    seed=42
-)
-
-# Configure training
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
-config = TrainingConfig(
-    output_dir="./ner_model",
-    experiment_name="ner_training",
-    num_epochs=15,
-    batch_size=16,
-    encoder_lr=1e-5,
-    task_lr=5e-4,
-    warmup_ratio=0.1,
-    scheduler_type="cosine",
-    fp16=True,
-    eval_strategy="epoch",
-    save_best=True,
-    early_stopping=True,
-    early_stopping_patience=3
-)
-
-# Train
-trainer = GLiNER2Trainer(model, config)
-trainer.train(train_data=train_data, val_data=val_data)
-
-# Load best model
-model = GLiNER2.from_pretrained("./ner_model/best")
-```
-
-For more details, see the [Training Tutorial](tutorial/9-training.md) and [Data Format Guide](tutorial/8-train_data.md).
-
-## 📄 License
-
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
-
-## 📚 Citation
-
-If you use GLiNER2 in your research, please cite:
-
-```bibtex
-@inproceedings{zaratiana-etal-2025-gliner2,
-    title = "{GL}i{NER}2: Schema-Driven Multi-Task Learning for Structured Information Extraction",
-    author = "Zaratiana, Urchade  and
-      Pasternak, Gil  and
-      Boyd, Oliver  and
-      Hurn-Maloney, George  and
-      Lewis, Ash",
-    editor = {Habernal, Ivan  and
-      Schulam, Peter  and
-      Tiedemann, J{\"o}rg},
-    booktitle = "Proceedings of the 2025 Conference on Empirical Methods in Natural Language Processing: System Demonstrations",
-    month = nov,
-    year = "2025",
-    address = "Suzhou, China",
-    publisher = "Association for Computational Linguistics",
-    url = "https://aclanthology.org/2025.emnlp-demos.10/",
-    pages = "130--140",
-    ISBN = "979-8-89176-334-0",
-    abstract = "Information extraction (IE) is fundamental to numerous NLP applications, yet existing solutions often require specialized models for different tasks or rely on computationally expensive large language models. We present GLiNER2, a unified framework that enhances the original GLiNER architecture to support named entity recognition, text classification, and hierarchical structured data extraction within a single efficient model. Built on a fine-tuned encoder architecture, GLiNER2 maintains CPU efficiency and compact size while introducing multi-task composition through an intuitive schema-based interface. Our experiments demonstrate competitive performance across diverse IE tasks with substantial improvements in deployment accessibility compared to LLM-based alternatives. We release GLiNER2 as an open-source library available through pip, complete with pre-trained models and comprehensive documentation."
+      }
+    ]
+  },
+  "fingerprint": "稳定且可复现的样本标识",
+  "augmentation": {
+    "source_fingerprints": ["原始样本标识"]
+  }
 }
 ```
 
-## 🙏 Acknowledgments
+数据要求：
 
-Built upon the original [GLiNER](https://github.com/urchade/GLiNER) architecture by the team at [Fastino AI](https://fastino.ai).
+- `input` 必须是原始文本。
+- `output.json_structures` 是成交列表；单句包含多笔成交时可以有多个 `deal`。
+- span 使用 `{text, start, end}`，其中 `start` 包含、`end` 不包含，并且必须满足 `input[start:end] == text`。
+- 多值字段使用 span 列表。当前列表字段包括 `send_to`、`send_from`、`contact_info`、`buyer_contact_info` 和 `seller_contact_info`。
+- 空字段可以为 `null`；数据准备脚本会统一注入完整 76 字段描述。
+- 强烈建议提供稳定的 `fingerprint`。增强或合并样本应在 `augmentation.source_fingerprints` 中保留所有来源，以便执行严格无泄漏切分。
+- 全部原始字段必须在 [`deal_field_descriptions.json`](test/schema/deal_field_descriptions.json) 中登记；新增或遗漏字段会触发字段契约错误。
 
----
+## 传入数据
 
-<div align="center">
-    <strong>Ready to extract insights from your data?</strong><br>
-    <code>pip install gliner2</code>
-</div>
+推荐通过环境变量 `BOND_DATA` 传入数据文件的绝对路径。数据可以位于仓库之外，不需要复制或上传到 GitHub。
+
+Linux/macOS：
+
+```bash
+export BOND_DATA=/absolute/path/to/bond_deals.jsonl
+```
+
+Windows PowerShell：
+
+```powershell
+$env:BOND_DATA = "D:\data\bond_deals.jsonl"
+```
+
+也可以只在单次命令中传入：
+
+```bash
+BOND_DATA=/absolute/path/to/bond_deals.jsonl bash test/run_full_server.sh
+```
+
+## 下载基础模型
+
+训练默认使用 `fastino/gliner2-base-v1`。服务器能够访问 Hugging Face 时，模型会按需下载；也可以提前下载并验证到 `test/models/gliner2-base-v1`：
+
+```bash
+python test/ensure_model.py
+```
+
+模型目录和所有权重文件已被 `.gitignore` 排除，不会上传到 GitHub。
+
+## 推荐训练流程：Linux GPU 服务器
+
+确认已经设置 `BOND_DATA` 后运行：
+
+```bash
+bash test/run_full_server.sh
+```
+
+脚本依次执行：
+
+1. 检查 Python、PyTorch、Transformers、CUDA、GPU 和显存。
+2. 校验原始字段与完整 76 字段 schema。
+3. 拆分可安全拆分的多成交句，并按同源连通分量划分 train/validation/test。
+4. 生成完整 schema 主训练集和低频/难字段聚焦训练集。
+5. 校验 span、文件格式和训练字段覆盖。
+6. 使用平衡数据进行全字段 NER 预热。
+7. 使用完整 deal 与聚焦字段族混合数据训练 Structure 模型。
+8. 仅使用完整 76 字段 schema，以较低学习率进行最终校准。
+9. 在验证集选择阈值，并在测试集执行一次正式评测。
+
+默认训练参数：
+
+| 环境变量 | 默认值 | 说明 |
+|---|---:|---|
+| `PYTHON_BIN` | `python3` | Python 可执行文件 |
+| `VARIANT` | `full_server` | 数据与输出子目录名 |
+| `NER_EPOCHS` | `4` | NER 训练轮数 |
+| `FOCUS_STRUCTURE_EPOCHS` | `8` | Structure 聚焦训练轮数 |
+| `FULL_CALIBRATION_EPOCHS` | `2` | 完整 schema 校准轮数 |
+| `BATCH_SIZE` | `4` | 训练 micro batch |
+| `EVAL_BATCH_SIZE` | `8` | 评测 batch |
+| `GRAD_ACCUM` | `4` | 梯度累积步数 |
+| `MAX_LEN` | `384` | 最大文本 word token 数 |
+| `NUM_WORKERS` | `4` | DataLoader worker 数 |
+| `EVAL_STEPS` | `250` | 验证间隔 |
+| `RARE_FIELD_TARGET` | `800` | 低频字段聚焦目标 support |
+| `FOCUS_MAX_REPEATS` | `4` | 单样本/字段族最大重复数 |
+| `PRECISION` | `bf16` | `bf16`、`fp16` 或 `fp32` |
+
+不支持 BF16 时：
+
+```bash
+PRECISION=fp16 bash test/run_full_server.sh
+```
+
+显存不足时：
+
+```bash
+BATCH_SIZE=2 GRAD_ACCUM=8 PRECISION=fp16 bash test/run_full_server.sh
+```
+
+完整服务器方案详见 [`test/FULL_SERVER_TRAINING.md`](test/FULL_SERVER_TRAINING.md)。
+
+## RTX 4060 基线流程
+
+Windows RTX 4060 可以运行：
+
+```powershell
+.\test\run_4060_overnight.ps1
+```
+
+该脚本同样使用完整 76 字段，但训练轮数和 batch 参数更适合 8GB 显存。详细说明见 [`test/OVERNIGHT_4060.md`](test/OVERNIGHT_4060.md)。
+
+## 分步准备与验证数据
+
+如果希望先检查数据而不训练：
+
+```bash
+python test/prepare_data.py \
+  --schema-mode full \
+  --variant full_server \
+  --split-multi \
+  --focus-training \
+  --rare-field-target 800 \
+  --focus-max-repeats 4
+
+python test/validate_data.py \
+  --data-dirs test/data/full_server \
+  --out test/logs/full_server/validate_data.json
+```
+
+关键生成文件：
+
+```text
+test/data/full_server/
+├── ner_train_clean.jsonl
+├── ner_train_balanced_clean.jsonl
+├── structure_train_clean.jsonl
+├── structure_train_balanced_clean.jsonl
+├── structure_val_clean.jsonl
+├── structure_test_clean.jsonl
+└── split_stats.json
+```
+
+其中 `split_stats.json` 会记录：
+
+- 76 字段原始正例数；
+- 严格连通分量数量与最大分量大小；
+- train/validation/test 实际规模；
+- 每个 split 的逐字段正例数；
+- 为保证训练字段覆盖而移动的完整分量；
+- 聚焦字段、重复次数和最终训练规模。
+
+## 输出与评测
+
+服务器流程最终模型和评测结果位于：
+
+```text
+test/outputs/structure/full_server/
+├── best/
+├── final/
+├── run_meta.json
+├── training_result.json
+└── eval_sentence_acc.json
+```
+
+正式评测指标包括：
+
+- `sentence_exact_match`：一句中的全部 deal 和全部非空字段完全一致才记为正确；
+- `field_micro_precision`、`field_micro_recall`、`field_micro_f1`；
+- `field_metrics`：76 个字段各自的 support、TP、FP、FN、precision、recall 和 F1；
+- `business_full_field_evaluation`：是否按完整 76 字段 schema 评测；
+- `business_field_coverage_ready`：测试集是否对全部字段都有非空正例覆盖。
+
+`business_field_coverage_ready=false` 时，不得把总准确率解释成“所有字段均已达到业务标准”。当前数据中部分字段全库仅有 1～4 个正例，聚焦训练只能增加已有样本的优化曝光，不能代替新增真实标注。
+
+## 测试
+
+运行字段契约和训练指标相关测试：
+
+```bash
+python -m pip install pytest
+python -m pytest -q \
+  tests/test_bond_full_field_evaluation.py \
+  tests/training/test_metrics.py \
+  tests/training/test_trainer_invariants.py \
+  tests/training/test_pr15_pr17_runtime.py
+```
+
+## 数据与版本管理
+
+以下路径不会进入 Git：
+
+```text
+test/data/
+test/logs/
+test/models/
+test/outputs/
+```
+
+同时忽略 `*.safetensors`、`*.bin`、`*.pt`、`*.pth`、`*.npy` 和日志文件。提交前建议执行：
+
+```bash
+git status --short
+git diff --cached --name-only
+```
+
+## 上游项目与许可证
+
+核心 GLiNER2 模型、处理器和训练框架来自 [fastino-ai/GLiNER2](https://github.com/fastino-ai/GLiNER2)。本仓库保留上游 Apache License 2.0，详见 [`LICENSE`](LICENSE)。债券76字段数据处理、训练课程、字段契约和评测流程是本仓库面向业务场景增加的扩展。
