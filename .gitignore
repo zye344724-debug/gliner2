@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+test/data/
+test/outputs/
+test/logs/
+test/models/
+
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.npy
