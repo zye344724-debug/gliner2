@@ -23,14 +23,26 @@ New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 function Invoke-Step {
     param(
         [string]$Name,
-        [string[]]$Arguments
+        [string[]]$Arguments,
+        [switch]$InteractiveProgress
     )
     Write-Host "`n==> $Name" -ForegroundColor Cyan
     $LogName = ($Name -replace "[^a-zA-Z0-9_-]", "_").Trim("_") + ".log"
     $LogPath = Join-Path $LogDir $LogName
-    & $Python @Arguments 2>&1 | Tee-Object -FilePath $LogPath
+    if ($InteractiveProgress) {
+        # Keep tqdm connected to the terminal. Tee-Object converts each
+        # carriage-return refresh into a separate displayed/logged line.
+        Write-Host "Progress is shown as one updating line; results are saved under outputs/." -ForegroundColor DarkGray
+        & $Python @Arguments
+    }
+    else {
+        & $Python @Arguments 2>&1 | Tee-Object -FilePath $LogPath
+    }
     $ExitCode = $LASTEXITCODE
     if ($ExitCode -ne 0) {
+        if ($InteractiveProgress) {
+            throw "$Name failed with exit code $ExitCode. See the terminal output above."
+        }
         throw "$Name failed with exit code $ExitCode. Full Python error: $LogPath"
     }
 }
@@ -58,12 +70,12 @@ $Common = @(
 Invoke-Step -Name "stage 1 - NER warm-up" -Arguments (@(
     (Join-Path $TestDir "train_ner.py"), "--epochs", "$NerEpochs",
     "--output-dir", $NerOut
-) + $Common)
+) + $Common) -InteractiveProgress
 
 Invoke-Step -Name "stage 2 - structure extraction" -Arguments (@(
     (Join-Path $TestDir "train_structure.py"), "--epochs", "$StructureEpochs",
     "--init-from", $NerOut, "--output-dir", $StructureOut
-) + $Common)
+) + $Common) -InteractiveProgress
 
 Invoke-Step -Name "test sentence exact match" -Arguments @(
     (Join-Path $TestDir "evaluate_sentence_acc.py"), "--schema-mode", "full",

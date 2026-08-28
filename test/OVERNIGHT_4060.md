@@ -6,9 +6,11 @@
 .\bond_gliner2_pkg\bond_gliner2_pkg\test\run_4060_overnight.ps1
 ```
 
-默认使用全部 10000 条原始数据，确保 76 个字段都有非空训练标签。多笔拼接句在可以可靠按标注区间切分时会拆成单笔句，随后按原始 fingerprint 分组做 80/10/10 切分，避免同源样本跨集合泄漏。训练和正式评估均使用完整 76 字段。数据准备会对原始字段与字段描述做严格对账；任何漏字段或新增未登记字段都会直接终止流程，并在统计中列出每个字段的有效标签数。
+默认使用全部 10000 条原始数据，确保 76 个字段都有非空训练标签。多笔拼接句在可以可靠按标注区间切分时会拆成单笔句，随后把共享任一 source fingerprint、fingerprint stem 或规范化文本的样本组成连通分量，再进行无泄漏切分。训练和正式评估均使用完整 76 字段。数据准备会对原始字段与字段描述做严格对账；任何漏字段或新增未登记字段都会直接终止流程，并在统计中列出每个字段的有效标签数。
 
-默认训练参数：NER 1 epoch，structure 3 epochs，micro batch 2，梯度累积 8，FP16，gradient checkpointing，最大长度 256。按当前完整数据和 seed 42 验证生成 26973/3372/3372 条 train/val/test，全部通过 span 与格式校验。
+默认训练参数：NER 1 epoch，structure 3 epochs，micro batch 2，梯度累积 8，FP16，gradient checkpointing，最大长度 256。严格同源连通后存在一个大型 multi-merge 分量，因此切分不会强行凑成 80/10/10；实际规模以新生成的 `split_stats.json` 为准。
+
+该脚本保留为 RTX 4060 基线。用于正式服务器长训和难字段聚焦的方案见 `test/FULL_SERVER_TRAINING.md`，入口为 `test/run_full_server.sh`。
 
 评估会先在验证集 300 条上从 0.35、0.45、0.55、0.65 中选择阈值，再用唯一选中的阈值评估测试集。测试集不会参与调参。
 

@@ -11,7 +11,9 @@ Steps:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import random
 import sys
 from collections import Counter, defaultdict
@@ -330,10 +332,154 @@ def group_key(sample: Dict[str, Any], idx: int) -> str:
 
 
 def build_groups(samples: List[Dict[str, Any]]) -> List[List[int]]:
-    buckets: Dict[str, List[int]] = defaultdict(list)
+    """Build true connected components across augmentation provenance.
+
+    A multi-merge row can share only one atomic source with another row.  Using
+    the whole source set as a dictionary key does not catch that overlap and can
+    leak the same deal (or an identical split child) into train and evaluation.
+    Union every shared fingerprint/source/text identity instead.
+    """
+    n = len(samples)
+    parent = list(range(n))
+    size = [1] * n
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            return
+        if size[ra] < size[rb]:
+            ra, rb = rb, ra
+        parent[rb] = ra
+        size[ra] += size[rb]
+
+    owner: Dict[str, int] = {}
     for i, sample in enumerate(samples):
-        buckets[group_key(sample, i)].append(i)
+        identities = []
+        fp = sample.get("fingerprint")
+        if fp:
+            identities.append("fp::" + str(fp).split("#")[0])
+        aug = sample.get("augmentation") or {}
+        identities.extend(
+            "src::" + str(source)
+            for source in (aug.get("source_fingerprints") or [])
+            if source
+        )
+        normalized_text = " ".join(str(sample.get("input", "")).split())
+        identities.append(
+            "text::" + hashlib.sha256(normalized_text.encode("utf-8")).hexdigest()
+        )
+        for identity in set(identities):
+            previous = owner.setdefault(identity, i)
+            union(i, previous)
+
+    buckets: Dict[int, List[int]] = defaultdict(list)
+    for i in range(n):
+        buckets[find(i)].append(i)
     return list(buckets.values())
+
+
+def _sample_positive_fields(sample: Dict[str, Any]) -> Set[str]:
+    fields: Set[str] = set()
+    for item in sample.get("output", {}).get("json_structures", []):
+        deal = item.get("deal", item)
+        if isinstance(deal, dict):
+            fields.update(
+                key for key, value in deal.items() if value not in (None, "", [])
+            )
+    return fields
+
+
+def build_focused_training_rows(
+    samples: List[Dict[str, Any]],
+    train_indices: List[int],
+    descriptions: Dict[str, Dict[str, str]],
+    rare_field_target: int,
+    max_repeats: int,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    """Create auxiliary small-schema rows for rare/confusable field families."""
+    schema_fields = set(descriptions.get("deal", {}))
+    configured = set().union(*cfg.FIELD_FOCUS_GROUPS.values())
+    if configured != schema_fields:
+        raise ValueError(
+            "FIELD_FOCUS_GROUPS must partition the full schema: "
+            f"missing={sorted(schema_fields - configured)}, "
+            f"unexpected={sorted(configured - schema_fields)}"
+        )
+
+    counts: Counter = Counter()
+    positives_by_index: Dict[int, Set[str]] = {}
+    for idx in train_indices:
+        positive = _sample_positive_fields(samples[idx])
+        positives_by_index[idx] = positive
+        counts.update(positive)
+
+    eligible = {
+        field
+        for field in schema_fields
+        if counts[field] < rare_field_target or field in cfg.HARD_FIELDS
+    }
+    ner_rows: List[Dict[str, Any]] = []
+    structure_rows: List[Dict[str, Any]] = []
+    rows_by_group: Counter = Counter()
+    repeats_by_field: Counter = Counter()
+
+    for idx in train_indices:
+        sample = samples[idx]
+        positive = positives_by_index[idx]
+        for group_name, family in cfg.FIELD_FOCUS_GROUPS.items():
+            targets = positive & family & eligible
+            if not targets:
+                continue
+            # Inverse-square-root repetition is deliberately capped: it gives
+            # rare labels more optimizer exposure without turning 1–4 examples
+            # into thousands of memorized copies.
+            rarest_count = min(max(1, counts[field]) for field in targets)
+            repeats = min(
+                max_repeats,
+                max(1, math.ceil(math.sqrt(rare_field_target / rarest_count))),
+            )
+            focus_fields = (set(family) | cfg.FOCUS_ANCHOR_FIELDS) & schema_fields
+            focus_desc = {
+                "deal": {
+                    key: value
+                    for key, value in descriptions["deal"].items()
+                    if key in focus_fields
+                }
+            }
+            for _ in range(repeats):
+                ner_rows.append(
+                    ner_record(sample, focus_desc, keep_fields=focus_fields)
+                )
+                structure_rows.append(
+                    structure_record(sample, focus_desc, keep_fields=focus_fields)
+                )
+                rows_by_group[group_name] += 1
+                repeats_by_field.update(targets)
+
+    ner_rows = [row for row in ner_rows if row["output"]["entities"]]
+    structure_rows = [
+        row for row in structure_rows if row["output"]["json_structures"]
+    ]
+    return ner_rows, structure_rows, {
+        "rare_field_target": rare_field_target,
+        "max_repeats": max_repeats,
+        "eligible_fields": sorted(eligible),
+        "train_positive_counts": {
+            field: counts[field] for field in sorted(schema_fields)
+        },
+        "focus_rows_by_group": dict(rows_by_group),
+        "focus_exposures_by_field": {
+            field: repeats_by_field[field] for field in sorted(eligible)
+        },
+        "n_focus_ner_rows": len(ner_rows),
+        "n_focus_structure_rows": len(structure_rows),
+    }
 
 
 def split_groups(
@@ -374,6 +520,75 @@ def split_groups(
         counts[choice] += len(idxs)
 
     return buckets["train"], buckets["val"], buckets["test"]
+
+
+def ensure_train_field_coverage(
+    samples: List[Dict[str, Any]],
+    groups: List[List[int]],
+    train_indices: List[int],
+    val_indices: List[int],
+    test_indices: List[int],
+    schema_fields: Set[str],
+) -> Tuple[List[int], List[int], List[int], Dict[str, Any]]:
+    """Move whole provenance groups so every labeled field occurs in train.
+
+    Ultra-rare business fields have only 1–4 examples.  A size-only split may
+    place all of them outside train, making the formal field contract fail.  We
+    move the smallest eligible *whole connected component* to train; this keeps
+    leakage isolation intact.  Validation/test coverage is reported separately
+    and is never fabricated by copying examples.
+    """
+    owner = {index: group_id for group_id, group in enumerate(groups) for index in group}
+    split_by_group: Dict[int, str] = {}
+    for name, indices in (
+        ("train", train_indices), ("val", val_indices), ("test", test_indices)
+    ):
+        for index in indices:
+            split_by_group[owner[index]] = name
+
+    group_fields: List[Set[str]] = []
+    for group in groups:
+        fields: Set[str] = set()
+        for index in group:
+            fields.update(_sample_positive_fields(samples[index]))
+        group_fields.append(fields)
+
+    train_fields = set().union(
+        *(group_fields[group_id] for group_id, name in split_by_group.items() if name == "train")
+    ) if split_by_group else set()
+    moves = []
+    for field in sorted(schema_fields - train_fields):
+        candidates = [
+            group_id
+            for group_id, fields in enumerate(group_fields)
+            if field in fields and split_by_group.get(group_id) != "train"
+        ]
+        if not candidates:
+            continue
+        group_id = min(candidates, key=lambda value: len(groups[value]))
+        source_split = split_by_group[group_id]
+        split_by_group[group_id] = "train"
+        train_fields.update(group_fields[group_id])
+        moves.append({
+            "field": field,
+            "from": source_split,
+            "group_size": len(groups[group_id]),
+        })
+
+    rebuilt = {"train": [], "val": [], "test": []}
+    for group_id, group in enumerate(groups):
+        rebuilt[split_by_group[group_id]].extend(group)
+    missing = sorted(schema_fields - train_fields)
+    if missing:
+        raise ValueError(
+            f"Raw data has no trainable positive examples for fields: {missing}"
+        )
+    return (
+        rebuilt["train"],
+        rebuilt["val"],
+        rebuilt["test"],
+        {"moved_groups": moves, "moved_group_count": len(moves)},
+    )
 
 
 def write_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> int:
@@ -451,7 +666,32 @@ def main() -> None:
         default=False,
         help="Split multi-deal sentences into single-deal sub-samples",
     )
+    parser.add_argument(
+        "--focus-training",
+        action="store_true",
+        help=(
+            "Add auxiliary small-schema training views for rare and difficult "
+            "field families; full-schema rows remain the primary task"
+        ),
+    )
+    parser.add_argument(
+        "--rare-field-target",
+        type=int,
+        default=800,
+        help="Fields below this train support receive focused repetitions",
+    )
+    parser.add_argument(
+        "--focus-max-repeats",
+        type=int,
+        default=4,
+        help="Maximum focused repetitions per sample and field family",
+    )
     args = parser.parse_args()
+
+    if args.focus_training and args.schema_mode != "full":
+        parser.error("--focus-training requires --schema-mode full")
+    if args.rare_field_target <= 0 or args.focus_max_repeats <= 0:
+        parser.error("focus target and repeat cap must be positive")
 
     variant = args.variant
     if variant is None and args.split_multi and args.schema_mode == "full":
@@ -496,6 +736,16 @@ def main() -> None:
     train_idx, val_idx, test_idx = split_groups(
         groups, args.seed, args.train_ratio, args.val_ratio
     )
+    coverage_adjustment = None
+    if args.schema_mode == "full":
+        train_idx, val_idx, test_idx, coverage_adjustment = ensure_train_field_coverage(
+            samples,
+            groups,
+            train_idx,
+            val_idx,
+            test_idx,
+            set(descriptions.get("deal", {})),
+        )
 
     out_dir = args.out_dir / variant
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -507,9 +757,11 @@ def main() -> None:
         "variant": variant,
         "seed": args.seed,
         "n_groups": len(groups),
+        "largest_group_size": max((len(group) for group in groups), default=0),
         "n_samples": len(samples),
         "business_full_field_evaluation": args.schema_mode == "full",
         "field_contract": field_contract,
+        "train_coverage_adjustment": coverage_adjustment,
         "splits": {},
     }
 
@@ -566,6 +818,48 @@ def main() -> None:
                         )
                         + "\n"
                     )
+
+    if args.focus_training:
+        focus_ner, focus_structure, focus_stats = build_focused_training_rows(
+            samples,
+            train_idx,
+            descriptions,
+            rare_field_target=args.rare_field_target,
+            max_repeats=args.focus_max_repeats,
+        )
+        base_ner = [
+            ner_record(samples[i], descriptions, keep_fields=keep_fields)
+            for i in train_idx
+        ]
+        base_structure = [
+            structure_record(samples[i], descriptions, keep_fields=keep_fields)
+            for i in train_idx
+        ]
+        base_ner = [row for row in base_ner if row["output"]["entities"]]
+        base_structure = [
+            row for row in base_structure if row["output"]["json_structures"]
+        ]
+        write_jsonl(
+            out_dir / "ner_train_balanced_clean.jsonl",
+            (
+                {"input": row["input"], "output": row["output"]}
+                for row in base_ner + focus_ner
+            ),
+        )
+        write_jsonl(
+            out_dir / "structure_train_balanced_clean.jsonl",
+            (
+                {"input": row["input"], "output": row["output"]}
+                for row in base_structure + focus_structure
+            ),
+        )
+        stats["focus_training"] = {
+            **focus_stats,
+            "n_primary_ner_rows": len(base_ner),
+            "n_primary_structure_rows": len(base_structure),
+            "n_balanced_ner_rows": len(base_ner) + len(focus_ner),
+            "n_balanced_structure_rows": len(base_structure) + len(focus_structure),
+        }
 
     stats_path = out_dir / "split_stats.json"
     with open(stats_path, "w", encoding="utf-8") as f:

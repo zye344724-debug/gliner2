@@ -138,6 +138,10 @@ class TrainingConfig:
         Whether higher metric is better.
     logging_steps : int
         Log every N steps (updates progress bar metrics).
+    show_progress_bar : bool
+        Show compact single-line training/evaluation progress bars.
+    progress_refresh_seconds : float
+        Minimum seconds between progress-bar redraws.
     report_to_wandb : bool
         Enable Weights & Biases logging.
     wandb_project : str, optional
@@ -204,6 +208,8 @@ class TrainingConfig:
     greater_is_better: bool = False
     logging_steps: int = 1
     logging_first_step: bool = True
+    show_progress_bar: bool = True
+    progress_refresh_seconds: float = 1.0
     report_to_wandb: bool = False
     wandb_project: Optional[str] = None
     wandb_entity: Optional[str] = None
@@ -292,6 +298,11 @@ class TrainingConfig:
         # Validate logging_steps
         if self.logging_steps <= 0:
             raise ValueError(f"logging_steps must be > 0, got {self.logging_steps}")
+        if self.progress_refresh_seconds <= 0:
+            raise ValueError(
+                "progress_refresh_seconds must be > 0, got "
+                f"{self.progress_refresh_seconds}"
+            )
         
         # Validate batch_size
         if self.batch_size <= 0:
@@ -1511,7 +1522,22 @@ class ExtractorTrainer:
         start_time = time.time()
         samples_seen = 0
 
-        self.progress_bar = tqdm(total=max_steps, desc="Training", disable=not self.is_main_process)
+        # A carriage-return progress bar is useful only on a real terminal.
+        # Disabling it for redirected/nohup output prevents every refresh from
+        # becoming a separate log line.
+        progress_disabled = (
+            not self.is_main_process
+            or not self.config.show_progress_bar
+            or not sys.stderr.isatty()
+        )
+        self.progress_bar = tqdm(
+            total=max_steps,
+            desc="Training",
+            disable=progress_disabled,
+            dynamic_ncols=True,
+            mininterval=self.config.progress_refresh_seconds,
+            leave=True,
+        )
 
         should_stop = False
         for epoch in range(num_epochs):
@@ -1755,7 +1781,18 @@ class ExtractorTrainer:
             boundary_head.collect_diagnostics = True
 
         with torch.no_grad():
-            for batch in tqdm(eval_loader, desc="Evaluating", disable=not self.is_main_process):
+            for batch in tqdm(
+                eval_loader,
+                desc="Evaluating",
+                disable=(
+                    not self.is_main_process
+                    or not self.config.show_progress_bar
+                    or not sys.stderr.isatty()
+                ),
+                dynamic_ncols=True,
+                mininterval=self.config.progress_refresh_seconds,
+                leave=False,
+            ):
                 with torch.amp.autocast(
                     device_type=self.device.type,
                     enabled=use_amp,

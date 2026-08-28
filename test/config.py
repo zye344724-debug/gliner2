@@ -72,6 +72,73 @@ CORE_FIELDS = [
     "bridge_trader_name",
 ]
 
+# Full-field auxiliary curricula.  The primary training rows always keep all
+# 76 fields; these groups create additional, smaller-schema views for examples
+# containing rare or semantically confusable labels.  Keeping confusable
+# siblings together (buyer/seller, call/maturity yield, etc.) teaches the model
+# the distinction instead of merely duplicating the same full-schema loss.
+FIELD_FOCUS_GROUPS = {
+    "bond_identity": {
+        "bond_code", "bond_name", "bond_type", "residual_maturity", "rating",
+    },
+    "pricing": {
+        "volume", "yield", "call_yield", "maturity_yield", "valuation",
+        "net_price", "full_price", "fee", "buyer_fee", "seller_fee",
+    },
+    "settlement": {
+        "settlement_type", "buyer_settlement_type", "seller_settlement_type",
+        "settlement_date", "buyer_settlement_date", "seller_settlement_date",
+        "date",
+    },
+    "parties": {
+        "institution", "buyer", "seller", "bridge_institution",
+        "contact_institution", "subject_name", "buyer_subject_name",
+        "seller_subject_name", "subject_short_name", "buyer_subject_short_name",
+        "seller_subject_short_name",
+    },
+    "people": {
+        "trader_name", "buyer_trader_name", "seller_trader_name",
+        "bridge_trader_name", "contact_person", "person_name", "sale_manager",
+    },
+    "delivery": {
+        "send_type", "buyer_send_type", "seller_send_type", "send_to",
+        "send_from", "send_to_trader", "send_from_trader", "contact_info",
+        "buyer_contact_info", "seller_contact_info",
+    },
+    "accounts_and_codes": {
+        "account", "buyer_account", "seller_account", "trader_code",
+        "buyer_trader_code", "seller_trader_code", "trading_subject_code",
+        "buyer_trading_subject_code", "seller_trading_subject_code",
+        "trading_broker_code", "buyer_trading_broker_code",
+        "seller_trading_broker_code", "trading_broker_name",
+        "buyer_trading_broker_name", "seller_trading_broker_name",
+        "seat_number", "buyer_seat_number", "seller_seat_number",
+    },
+    "workflow": {
+        "serial_number", "order_number", "agreement_no", "sale_department",
+        "source", "exchange", "trade_intent", "deal_update_action",
+    },
+}
+
+# These fields are difficult because their label depends on direction, role, or
+# an action cue rather than surface form alone.  They receive at least one focus
+# view even when their raw frequency is above the automatic rare-field cutoff.
+HARD_FIELDS = {
+    "buyer", "seller", "institution", "bridge_institution",
+    "buyer_settlement_type", "seller_settlement_type",
+    "buyer_settlement_date", "seller_settlement_date",
+    "send_type", "buyer_send_type", "seller_send_type",
+    "send_to", "send_from", "send_to_trader", "send_from_trader",
+    "buyer_account", "seller_account", "buyer_trader_name",
+    "seller_trader_name", "bridge_trader_name", "call_yield",
+    "maturity_yield", "buyer_fee", "seller_fee",
+}
+
+# Stable deal-identifying context included in every focused structure view.
+FOCUS_ANCHOR_FIELDS = {
+    "bond_code", "bond_name", "serial_number", "volume", "yield",
+}
+
 # Training defaults (override via CLI)
 # Mac CPU: use smaller batch; GPU server can override via env.
 NER_EPOCHS = 5
