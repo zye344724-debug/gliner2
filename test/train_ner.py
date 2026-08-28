@@ -9,8 +9,10 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+REPO_ROOT = ROOT.parent
+for path in (REPO_ROOT, ROOT):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
 import config as cfg
 from field_contract import validate_training_fields

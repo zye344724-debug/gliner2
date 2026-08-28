@@ -16,8 +16,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 ROOT = Path(__file__).resolve().parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+REPO_ROOT = ROOT.parent
+for path in (REPO_ROOT, ROOT):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
 import config as cfg
 
