@@ -29,6 +29,27 @@ def test_raw_data_and_business_schema_cover_same_76_fields():
     assert contract["all_fields_have_non_null_labels"] is True
 
 
+def test_sample_cap_preserves_all_76_positive_fields():
+    prepare = load_script("prepare_data")
+    raw = ROOT / "test" / "data" / "bond_deal_0805_structured_aug_v1_sample_10000.jsonl"
+    samples = [json.loads(line) for line in raw.open(encoding="utf-8")]
+    fields = set(prepare.load_descriptions()["deal"])
+
+    selected, stats = prepare.select_coverage_balanced_samples(
+        samples, max_samples=1000, fields=fields, seed=42
+    )
+    contract = prepare.validate_full_schema(selected, prepare.load_descriptions())
+
+    assert len(selected) == 1000
+    assert stats["enabled"] is True
+    assert stats["source_samples"] == 10000
+    assert stats["selected_samples"] == 1000
+    assert set(stats["selected_positive_counts"]) == fields
+    assert min(stats["selected_positive_counts"].values()) >= 1
+    assert contract["schema_field_count"] == 76
+    assert contract["all_fields_have_non_null_labels"] is True
+
+
 def test_evaluation_contract_rejects_a_partial_declared_schema():
     evaluate = load_script("evaluate_sentence_acc")
     descriptions = {"deal": {"bond_code": "code", "buyer": "buyer"}}

@@ -48,6 +48,87 @@ def collect_raw_field_counts(samples: Iterable[Dict[str, Any]]) -> Tuple[Counter
     return present, non_null
 
 
+def select_coverage_balanced_samples(
+    samples: List[Dict[str, Any]],
+    max_samples: int,
+    fields: Set[str],
+    seed: int,
+    min_examples_per_field: int = 16,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Cap raw rows without dropping rare business fields.
+
+    Reserve a deterministic quota for every field first (all examples when the
+    total support is below the quota), then fill the remaining row budget with
+    a seeded sample. This avoids the field loss caused by prefix truncation.
+    """
+    positives = [_sample_positive_fields(sample) & fields for sample in samples]
+    if max_samples <= 0 or max_samples >= len(samples):
+        counts = Counter()
+        for positive in positives:
+            counts.update(positive)
+        return samples, {
+            "enabled": False,
+            "source_samples": len(samples),
+            "selected_samples": len(samples),
+            "min_examples_per_field": min_examples_per_field,
+            "selected_positive_counts": {
+                field: counts[field] for field in sorted(fields)
+            },
+        }
+
+    indices_by_field: Dict[str, List[int]] = defaultdict(list)
+    for index, positive in enumerate(positives):
+        for field in positive:
+            indices_by_field[field].append(index)
+    missing_source = sorted(fields - set(indices_by_field))
+    if missing_source:
+        raise ValueError(f"Raw data has no positive examples for fields: {missing_source}")
+
+    rng = random.Random(seed)
+    selected: Set[int] = set()
+    counts: Counter = Counter()
+    for field in sorted(fields, key=lambda name: (len(indices_by_field[name]), name)):
+        target = min(min_examples_per_field, len(indices_by_field[field]))
+        candidates = list(indices_by_field[field])
+        rng.shuffle(candidates)
+        for index in candidates:
+            if counts[field] >= target:
+                break
+            if index in selected:
+                continue
+            selected.add(index)
+            counts.update(positives[index])
+
+    reserved = len(selected)
+    if reserved > max_samples:
+        raise ValueError(
+            f"--max-samples={max_samples} is too small for coverage-balanced "
+            f"selection; at least {reserved} rows are required"
+        )
+    remaining = [index for index in range(len(samples)) if index not in selected]
+    rng.shuffle(remaining)
+    selected.update(remaining[: max_samples - reserved])
+    selected_indices = sorted(selected)
+
+    counts = Counter()
+    for index in selected_indices:
+        counts.update(positives[index])
+    missing_selected = sorted(fields - set(counts))
+    if missing_selected:
+        raise AssertionError(f"Coverage sampler lost fields: {missing_selected}")
+
+    return [samples[index] for index in selected_indices], {
+        "enabled": True,
+        "source_samples": len(samples),
+        "selected_samples": len(selected_indices),
+        "coverage_reserved_samples": reserved,
+        "min_examples_per_field": min_examples_per_field,
+        "selected_positive_counts": {
+            field: counts[field] for field in sorted(fields)
+        },
+    }
+
+
 def validate_full_schema(
     samples: Iterable[Dict[str, Any]], descriptions: Dict[str, Dict[str, str]]
 ) -> Dict[str, Any]:
@@ -653,7 +734,10 @@ def main() -> None:
         "--max-samples",
         type=int,
         default=-1,
-        help="Optional cap for smoke tests",
+        help=(
+            "Optional raw-row cap using deterministic field-coverage sampling; "
+            "does not truncate the input prefix"
+        ),
     )
     parser.add_argument(
         "--variant",
@@ -713,16 +797,24 @@ def main() -> None:
             }
         }
 
-    samples: List[Dict[str, Any]] = []
+    source_samples: List[Dict[str, Any]] = []
     with open(args.raw, encoding="utf-8") as f:
         for line in f:
-            samples.append(json.loads(line))
-            if args.max_samples > 0 and len(samples) >= args.max_samples:
-                break
+            source_samples.append(json.loads(line))
 
     # The formal business route is deliberately fail-closed: adding a raw field
     # without adding its description (or silently losing one) must stop the run.
+    source_field_contract = None
     field_contract = None
+    if args.schema_mode == "full":
+        source_field_contract = validate_full_schema(source_samples, descriptions)
+
+    samples, sampling_stats = select_coverage_balanced_samples(
+        source_samples,
+        args.max_samples,
+        set(descriptions.get("deal", {})),
+        args.seed,
+    )
     if args.schema_mode == "full":
         field_contract = validate_full_schema(samples, descriptions)
 
@@ -760,6 +852,8 @@ def main() -> None:
         "largest_group_size": max((len(group) for group in groups), default=0),
         "n_samples": len(samples),
         "business_full_field_evaluation": args.schema_mode == "full",
+        "sampling": sampling_stats,
+        "source_field_contract": source_field_contract,
         "field_contract": field_contract,
         "train_coverage_adjustment": coverage_adjustment,
         "splits": {},
