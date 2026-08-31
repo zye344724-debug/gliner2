@@ -14,15 +14,31 @@ bash test/run_full_server.sh
 
 默认参数适合支持 BF16 的单卡服务器：
 
-- NER 全字段聚焦训练：4 epochs
-- Structure 全字段 + 聚焦训练：8 epochs
+- NER 全字段聚焦训练：2 epochs
+- Structure 全字段 + 聚焦训练：4 epochs
 - Structure 完整 schema 低学习率校准：2 epochs
 - micro batch：4
 - gradient accumulation：4
 - 有效 batch：16
 - `max_len`：384 个文本 word token
-- 低频目标 support：800
-- 单样本/字段族最多聚焦重复：4
+- 低频目标 support：500
+- 单样本/字段族最多聚焦重复：2
+
+该默认档位只使用原始 10000 条数据，但把总训练轮数从 14 降到 8，
+并减少机械式低频重复。按相同 GPU 和 batch 配置，主要训练工作量约为旧默认
+档位的一半；双卡服务器建议显式设置 `NUM_GPUS=2`。如需复现旧的长训练档位：
+
+```bash
+NER_EPOCHS=4 FOCUS_STRUCTURE_EPOCHS=8 FULL_CALIBRATION_EPOCHS=2 \
+RARE_FIELD_TARGET=800 FOCUS_MAX_REPEATS=4 EVAL_STEPS=250 \
+bash test/run_full_server.sh
+```
+
+双卡运行示例（默认 micro batch 和梯度累积下，全局有效 batch 为 32）：
+
+```bash
+NUM_GPUS=2 GPU_IDS=0,1 bash test/run_full_server.sh
+```
 
 不支持 BF16 时：
 
@@ -66,17 +82,17 @@ BATCH_SIZE=2 GRAD_ACCUM=8 PRECISION=fp16 bash test/run_full_server.sh
 
 | 参数 | 默认值 |
 |---|---:|
-| `NER_EPOCHS` | 4 |
-| `FOCUS_STRUCTURE_EPOCHS` | 8 |
+| `NER_EPOCHS` | 2 |
+| `FOCUS_STRUCTURE_EPOCHS` | 4 |
 | `FULL_CALIBRATION_EPOCHS` | 2 |
 | `BATCH_SIZE` | 4 |
 | `EVAL_BATCH_SIZE` | 8 |
 | `GRAD_ACCUM` | 4 |
 | `MAX_LEN` | 384 |
 | `NUM_WORKERS` | 4 |
-| `EVAL_STEPS` | 250 |
-| `RARE_FIELD_TARGET` | 800 |
-| `FOCUS_MAX_REPEATS` | 4 |
+| `EVAL_STEPS` | 500 |
+| `RARE_FIELD_TARGET` | 500 |
+| `FOCUS_MAX_REPEATS` | 2 |
 | `PRECISION` | `bf16` |
 
 最终结果位于：
@@ -86,3 +102,16 @@ test/outputs/structure/full_server/eval_sentence_acc.json
 ```
 
 评测先在完整验证集上从一次置信度推理中学习逐字段阈值，再应用到测试集。结果文件包含完整字段的句级严格准确率、Micro 指标、逐字段 support/precision/recall/F1、逐字段阈值、逐句错误字段与 gold/pred，以及测试集是否具备 76 字段正例覆盖的声明。
+
+正式评测默认启用债券字段边界规范化：模型仍负责字段、角色和记录归属，
+规则层只清理“发、走、请求、交易所、行权”等粘连在正确 span 上的业务提示词。
+可用 `--no-boundary-normalization` 运行未规范化的诊断基线。
+
+业务推理代码也可以对模型的格式化输出调用同一个无副作用函数：
+
+```python
+from test.bond_boundary_normalizer import normalize_prediction_boundaries
+
+prediction = model.extract_json(text, schema)
+prediction = normalize_prediction_boundaries(prediction)
+```

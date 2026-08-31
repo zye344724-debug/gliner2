@@ -152,6 +152,78 @@ def test_per_field_threshold_tuning_uses_cached_confidences():
     assert diagnostics["exact_after_coordinate_tuning"] == 1.0
 
 
+def test_bond_boundary_normalization_is_prediction_only():
+    evaluate = load_script("evaluate_sentence_acc")
+    gold = {
+        "json_structures": [
+            {
+                "deal": {
+                    "send_to": ["南京银行"],
+                    "bridge_institution": "南京银行",
+                    "send_type": "请求",
+                    "call_yield": "1.79",
+                    "settlement_date": "07.07",
+                }
+            }
+        ]
+    }
+    prediction = {
+        "deal": [
+            {
+                "send_to": ["发南京银行"],
+                "bridge_institution": "发请求给南京银行",
+                "send_type": "发南京银行请求",
+                "call_yield": "1.79行权",
+                "settlement_date": "07.07交易所",
+            }
+        ]
+    }
+
+    gold_deals = evaluate.deals_from_gold_output(gold)
+    raw_pred = evaluate.deals_from_prediction(
+        prediction, normalize_boundaries=False
+    )
+    normalized_pred = evaluate.deals_from_prediction(prediction)
+
+    assert evaluate.sentence_exact_match(gold_deals, raw_pred) is False
+    assert evaluate.sentence_exact_match(gold_deals, normalized_pred) is True
+
+
+def test_boundary_normalizer_keeps_nonempty_and_unrelated_values():
+    normalizer = load_script("bond_boundary_normalizer")
+
+    assert normalizer.normalize_boundary_text("send_to", "发") == "发"
+    assert normalizer.normalize_boundary_text("buyer", "发改委") == "发改委"
+    assert normalizer.normalize_boundary_text("send_to_trader", "发财") == "发财"
+    assert normalizer.normalize_boundary_text("seller_fee", "留4厘") == "4厘"
+
+
+def test_boundary_normalizer_preserves_confidence_and_tightens_offsets():
+    normalizer = load_script("bond_boundary_normalizer")
+    prediction = {
+        "deal": [
+            {
+                "send_to": {
+                    "text": "发南京银行",
+                    "confidence": 0.9,
+                    "start": 10,
+                    "end": 15,
+                }
+            }
+        ]
+    }
+
+    normalized = normalizer.normalize_prediction_boundaries(prediction)
+
+    assert prediction["deal"][0]["send_to"]["text"] == "发南京银行"
+    assert normalized["deal"][0]["send_to"] == {
+        "text": "南京银行",
+        "confidence": 0.9,
+        "start": 11,
+        "end": 15,
+    }
+
+
 def test_training_contract_rejects_missing_field_labels(tmp_path):
     contract = load_script("field_contract")
     path = tmp_path / "ner.jsonl"

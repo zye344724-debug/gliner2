@@ -880,6 +880,23 @@ class ExtractorTrainer:
     def is_main_process(self) -> bool:
         return not self.is_distributed or dist.get_rank() == 0
 
+    def _distributed_barrier(self) -> None:
+        """Keep all ranks aligned around rank-zero-only filesystem work."""
+        if self.is_distributed and dist.is_initialized():
+            dist.barrier()
+
+    def _broadcast_main_bool(self, value: bool) -> bool:
+        """Use rank zero as the authority for control-flow decisions."""
+        if not self.is_distributed or not dist.is_initialized():
+            return value
+        flag = torch.tensor(
+            int(value) if self.is_main_process else 0,
+            device=self.device,
+            dtype=torch.int32,
+        )
+        dist.broadcast(flag, src=0)
+        return bool(flag.item())
+
     @staticmethod
     def _safe_divide(numerator: float, denominator: float, default: float = 0.0) -> float:
         """Safely divide two numbers, returning default if denominator is zero."""
@@ -1670,11 +1687,17 @@ class ExtractorTrainer:
                         eval_metrics = self._evaluate(eval_dataset)
                         self.model.train()
                         self.processor.change_mode(is_training=True)
-                        if self.config.early_stopping and self._check_early_stopping(eval_metrics, prev_best):
+                        stop_now = bool(
+                            self.config.early_stopping
+                            and self._check_early_stopping(eval_metrics, prev_best)
+                        )
+                        stop_now = self._broadcast_main_bool(stop_now)
+                        if stop_now:
                             logger.info(f"Early stopping triggered at step {self.global_step}")
                             should_stop = True
                             break
                     self._save_checkpoint(f"checkpoint-{self.global_step}")
+                    self._distributed_barrier()
 
                 self.progress_bar.update(1)
 
@@ -1710,10 +1733,16 @@ class ExtractorTrainer:
                     eval_metrics = self._evaluate(eval_dataset)
                     self.model.train()
                     self.processor.change_mode(is_training=True)
-                    if self.config.early_stopping and self._check_early_stopping(eval_metrics, prev_best):
+                    stop_now = bool(
+                        self.config.early_stopping
+                        and self._check_early_stopping(eval_metrics, prev_best)
+                    )
+                    stop_now = self._broadcast_main_bool(stop_now)
+                    if stop_now:
                         logger.info(f"Early stopping triggered at epoch {epoch + 1}")
                         break
                 self._save_checkpoint(f"checkpoint-epoch-{epoch + 1}")
+                self._distributed_barrier()
 
             if self.global_step >= max_steps:
                 break
@@ -1721,8 +1750,9 @@ class ExtractorTrainer:
         self.progress_bar.close()
         self.progress_bar = None
 
+        self._save_checkpoint("final")
+        self._distributed_barrier()
         if self.is_main_process:
-            self._save_checkpoint("final")
             if self.config.report_to_wandb:
                 import wandb
                 wandb.summary["best_metric"] = self.best_metric
@@ -1827,6 +1857,33 @@ class ExtractorTrainer:
         if boundary_head is not None:
             boundary_head.collect_diagnostics = previous_collect
 
+        # Every rank evaluates a different DistributedSampler shard. Reduce
+        # sums and counts before computing metrics so best-model selection and
+        # early stopping make identical decisions on all ranks.
+        if self.is_distributed and dist.is_initialized():
+            aggregate = torch.tensor(
+                [
+                    total_loss,
+                    total_cls_loss,
+                    total_struct_loss,
+                    total_count_loss,
+                    float(num_batches),
+                ],
+                device=self.device,
+                dtype=torch.float64,
+            )
+            dist.all_reduce(aggregate, op=dist.ReduceOp.SUM)
+            (
+                total_loss,
+                total_cls_loss,
+                total_struct_loss,
+                total_count_loss,
+                reduced_batches,
+            ) = aggregate.tolist()
+            num_batches = int(reduced_batches)
+            for value in proposal_counts.values():
+                dist.all_reduce(value, op=dist.ReduceOp.SUM)
+
         # Fix Bug #4: Safe division for evaluation metrics
         metrics = {
             "eval_loss": self._safe_divide(total_loss, num_batches, default=0.0),
@@ -1854,6 +1911,7 @@ class ExtractorTrainer:
             self.best_metric = metric_value
             if self.config.save_best:
                 self._save_checkpoint("best")
+                self._distributed_barrier()
             logger.info(f"New best {self.config.metric_for_best}: {self.best_metric:.4f}")
 
         return metrics

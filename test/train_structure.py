@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -103,6 +104,8 @@ def resolve_init(args: argparse.Namespace, data_variant: str) -> str:
 
 def main() -> None:
     args = parse_args()
+    is_primary = int(os.environ.get("RANK", "0")) == 0
+    local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
     data_variant = args.data_variant or args.schema_mode
     data_dir = cfg.resolve_data_dir(args.schema_mode, data_variant)
     train_file = args.train_file or (data_dir / "structure_train_clean.jsonl")
@@ -130,6 +133,16 @@ def main() -> None:
 
     print(f"Loading init model: {init_path}")
     model = GLiNER2.from_pretrained(init_path, map_location="cpu")
+
+    # Bond structure rows do not contain classification tasks. Freeze that
+    # fixed-unused head so DDP only reduces parameters used by this stage.
+    frozen_modules = ("classifier",)
+    for module_name in frozen_modules:
+        module = getattr(model, module_name)
+        for parameter in module.parameters():
+            parameter.requires_grad_(False)
+    if is_primary:
+        print(f"Frozen unused structure heads: {', '.join(frozen_modules)}")
 
     train_cfg = TrainingConfig(
         output_dir=str(output_dir),
@@ -160,6 +173,10 @@ def main() -> None:
         early_stopping_patience=max(1, args.early_stopping_patience),
         save_total_limit=2,
         report_to_wandb=False,
+        local_rank=local_rank,
+        # PyTorch DDP static_graph is incompatible with a first backward under
+        # no_sync(), which is how gradient accumulation starts in this trainer.
+        ddp_static_graph=False if local_rank >= 0 else True,
     )
     apply_mac_training_defaults(train_cfg)
 
@@ -171,14 +188,16 @@ def main() -> None:
         "schema_mode": args.schema_mode,
         "data_variant": data_variant,
         "field_contract": field_contract,
+        "frozen_modules": list(frozen_modules),
         "config": {k: getattr(train_cfg, k) for k in [
             "num_epochs", "max_steps", "batch_size", "gradient_accumulation_steps",
             "encoder_lr", "task_lr", "max_len", "seed", "fp16", "bf16",
             "gradient_checkpointing", "early_stopping", "early_stopping_patience",
         ]},
     }
-    with open(output_dir / "run_meta.json", "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
+    if is_primary:
+        with open(output_dir / "run_meta.json", "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
 
     trainer = GLiNER2Trainer(model, train_cfg)
     print(f"Train: {train_file}")
@@ -188,9 +207,10 @@ def main() -> None:
         train_data=str(train_file),
         eval_data=str(eval_file) if eval_file.exists() else None,
     )
-    with open(output_dir / "training_result.json", "w", encoding="utf-8") as f:
-        json.dump(result if isinstance(result, dict) else {"result": str(result)},
-                  f, ensure_ascii=False, indent=2, default=str)
+    if is_primary:
+        with open(output_dir / "training_result.json", "w", encoding="utf-8") as f:
+            json.dump(result if isinstance(result, dict) else {"result": str(result)},
+                      f, ensure_ascii=False, indent=2, default=str)
     print("Structure training done.")
     print(f"Best / latest checkpoint under: {output_dir}")
 

@@ -15,6 +15,8 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from tqdm.auto import tqdm
+
 ROOT = Path(__file__).resolve().parent
 REPO_ROOT = ROOT.parent
 for path in (REPO_ROOT, ROOT):
@@ -22,6 +24,7 @@ for path in (REPO_ROOT, ROOT):
         sys.path.insert(0, str(path))
 
 import config as cfg
+from bond_boundary_normalizer import normalize_field_boundary
 
 
 def normalize_value(value: Any) -> Any:
@@ -47,10 +50,14 @@ def normalize_value(value: Any) -> Any:
     return value
 
 
-def compact_deal(deal: Dict[str, Any]) -> Tuple[Tuple[str, Any], ...]:
+def compact_deal(
+    deal: Dict[str, Any], *, normalize_boundaries: bool = False
+) -> Tuple[Tuple[str, Any], ...]:
     items = []
     for k, v in deal.items():
         nv = normalize_value(v)
+        if normalize_boundaries:
+            nv = normalize_field_boundary(k, nv)
         if nv in (None, "", (), []):
             continue
         items.append((k, nv))
@@ -68,7 +75,9 @@ def deals_from_gold_output(output: Dict[str, Any]) -> List[Tuple[Tuple[str, Any]
     return deals
 
 
-def deals_from_prediction(pred: Dict[str, Any]) -> List[Tuple[Tuple[str, Any], ...]]:
+def deals_from_prediction(
+    pred: Dict[str, Any], *, normalize_boundaries: bool = True
+) -> List[Tuple[Tuple[str, Any], ...]]:
     """Accept both official extract_json shapes and training shapes."""
     deals: List[Tuple[Tuple[str, Any], ...]] = []
 
@@ -79,22 +88,36 @@ def deals_from_prediction(pred: Dict[str, Any]) -> List[Tuple[Tuple[str, Any], .
     if "deal" in pred and isinstance(pred["deal"], list):
         for deal in pred["deal"]:
             if isinstance(deal, dict):
-                compact = compact_deal(deal)
+                compact = compact_deal(
+                    deal, normalize_boundaries=normalize_boundaries
+                )
                 if compact:
                     deals.append(compact)
         return deals
 
     # Shape B: {"json_structures": [{"deal": {...}}, ...]}
     if "json_structures" in pred:
-        return deals_from_gold_output(pred)
+        for item in pred.get("json_structures", []):
+            deal = item.get("deal", item) if isinstance(item, dict) else None
+            if isinstance(deal, dict):
+                compact = compact_deal(
+                    deal, normalize_boundaries=normalize_boundaries
+                )
+                if compact:
+                    deals.append(compact)
+        return deals
 
     # Shape C: nested under "structures" / raw list
     if isinstance(pred, list):
         for item in pred:
             if isinstance(item, dict) and "deal" in item:
-                compact = compact_deal(item["deal"])
+                compact = compact_deal(
+                    item["deal"], normalize_boundaries=normalize_boundaries
+                )
             elif isinstance(item, dict):
-                compact = compact_deal(item)
+                compact = compact_deal(
+                    item, normalize_boundaries=normalize_boundaries
+                )
             else:
                 continue
             if compact:
@@ -305,11 +328,15 @@ def filter_prediction_by_field_thresholds(
     return result
 
 
-def _field_metric(rows, predictions, field: str) -> Dict[str, float]:
+def _field_metric(
+    rows, predictions, field: str, normalize_boundaries: bool = True
+) -> Dict[str, float]:
     counts: Counter = Counter()
     for row, prediction in zip(rows, predictions):
         gold = deals_from_gold_output(row["output"])
-        pred = deals_from_prediction(prediction)
+        pred = deals_from_prediction(
+            prediction, normalize_boundaries=normalize_boundaries
+        )
         counts.update(per_field_scores(gold, pred).get(field, {}))
     tp, fp, fn = counts["tp"], counts["fp"], counts["fn"]
     precision = tp / (tp + fp) if tp + fp else 0.0
@@ -332,6 +359,7 @@ def tune_field_thresholds(
     fields,
     candidates,
     default_threshold,
+    normalize_boundaries=True,
 ):
     """Tune thresholds on validation without repeating model inference.
 
@@ -341,7 +369,13 @@ def tune_field_thresholds(
     """
     thresholds = {field: default_threshold for field in fields}
     diagnostics: Dict[str, Any] = {"field_scores": {}}
-    for field in fields:
+    for field in tqdm(
+        fields,
+        desc="Field F1 tuning",
+        unit="field",
+        dynamic_ncols=True,
+        mininterval=1.0,
+    ):
         scores = {}
         for candidate in candidates:
             trial = dict(thresholds)
@@ -352,7 +386,9 @@ def tune_field_thresholds(
                 )
                 for prediction in confidence_predictions
             ]
-            scores[str(candidate)] = _field_metric(rows, filtered, field)
+            scores[str(candidate)] = _field_metric(
+                rows, filtered, field, normalize_boundaries
+            )
         support = max((metric["support"] for metric in scores.values()), default=0)
         if support:
             chosen = max(
@@ -379,10 +415,16 @@ def tune_field_thresholds(
         filter_prediction_by_field_thresholds(pred, thresholds, default_threshold)
         for pred in confidence_predictions
     ]
-    current_exact = exact_accuracy(rows, filtered)
+    current_exact = exact_accuracy(rows, filtered, normalize_boundaries)
     diagnostics["exact_after_field_f1_tuning"] = current_exact
     # One cheap coordinate pass aligns field-F1 choices with the business metric.
-    for field in fields:
+    for field in tqdm(
+        fields,
+        desc="Exact-match tuning",
+        unit="field",
+        dynamic_ncols=True,
+        mininterval=1.0,
+    ):
         current = thresholds[field]
         best, best_exact = current, current_exact
         for candidate in candidates:
@@ -396,7 +438,9 @@ def tune_field_thresholds(
                 )
                 for prediction in confidence_predictions
             ]
-            score = exact_accuracy(rows, trial_predictions)
+            score = exact_accuracy(
+                rows, trial_predictions, normalize_boundaries
+            )
             if score > best_exact:
                 best, best_exact = candidate, score
         thresholds[field] = best
@@ -454,6 +498,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-len", type=int, default=cfg.MAX_LEN)
     p.add_argument("--limit", type=int, default=-1)
     p.add_argument("--batch-size", type=int, default=4)
+    p.add_argument(
+        "--device",
+        default="auto",
+        help="Inference device: auto, cpu, cuda, cuda:N, or mps (default: auto)",
+    )
+    p.add_argument(
+        "--no-boundary-normalization",
+        action="store_true",
+        help="Disable bond-specific cue-word boundary cleanup",
+    )
     p.add_argument("--out", type=Path, default=None)
     return p.parse_args()
 
@@ -469,12 +523,27 @@ def load_rows(path: Path, limit: int = -1) -> List[Dict[str, Any]]:
 
 
 def run_inference(
-    model, rows, schema, threshold, max_len, batch_size, include_confidence=False
+    model,
+    rows,
+    schema,
+    threshold,
+    max_len,
+    batch_size,
+    include_confidence=False,
+    desc="Inference",
 ):
     texts = [r["input"] for r in rows]
     preds = []
     bs = max(1, batch_size)
-    for i in range(0, len(texts), bs):
+    starts = range(0, len(texts), bs)
+    for i in tqdm(
+        starts,
+        total=(len(texts) + bs - 1) // bs,
+        desc=desc,
+        unit="batch",
+        dynamic_ncols=True,
+        mininterval=1.0,
+    ):
         chunk = texts[i : i + bs]
         if hasattr(model, "batch_extract_json"):
             chunk_preds = model.batch_extract_json(
@@ -500,12 +569,15 @@ def run_inference(
     return preds
 
 
-def exact_accuracy(rows, preds) -> float:
+def exact_accuracy(rows, preds, normalize_boundaries: bool = True) -> float:
     if not rows:
         return 0.0
     return sum(
         sentence_exact_match(
-            deals_from_gold_output(row["output"]), deals_from_prediction(pred)
+            deals_from_gold_output(row["output"]),
+            deals_from_prediction(
+                pred, normalize_boundaries=normalize_boundaries
+            ),
         )
         for row, pred in zip(rows, preds)
     ) / len(rows)
@@ -513,6 +585,7 @@ def exact_accuracy(rows, preds) -> float:
 
 def main() -> None:
     args = parse_args()
+    normalize_boundaries = not args.no_boundary_normalization
     if args.schema_mode != "full" and not args.allow_partial_schema:
         raise ValueError(
             "Partial-schema evaluation is diagnostic only. Formal business "
@@ -546,9 +619,24 @@ def main() -> None:
     field_contract = validate_field_contract(rows, descriptions)
 
     from gliner2 import GLiNER2
+    import torch
+
+    if args.device == "auto":
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
+    else:
+        device = args.device
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError(f"CUDA evaluation requested but CUDA is unavailable: {device}")
 
     print(f"Loading model: {model_dir}")
-    model = GLiNER2.from_pretrained(str(model_dir))
+    print(f"Evaluation device: {device}")
+    model = GLiNER2.from_pretrained(str(model_dir), map_location=device)
+    model.eval()
     schema = build_structure_schema(descriptions, cfg.LIST_FIELDS)
 
     threshold = args.threshold
@@ -562,9 +650,17 @@ def main() -> None:
             raise ValueError("--tune-thresholds did not contain a number")
         for candidate in candidates:
             tune_preds = run_inference(
-                model, tune_rows, schema, candidate, args.max_len, args.batch_size
+                model,
+                tune_rows,
+                schema,
+                candidate,
+                args.max_len,
+                args.batch_size,
+                desc=f"Validation threshold {candidate:.2f}",
             )
-            tuning_scores[str(candidate)] = exact_accuracy(tune_rows, tune_preds)
+            tuning_scores[str(candidate)] = exact_accuracy(
+                tune_rows, tune_preds, normalize_boundaries
+            )
             print(f"validation threshold={candidate:.3f} exact={tuning_scores[str(candidate)]:.4f}")
         threshold = max(
             candidates,
@@ -594,6 +690,7 @@ def main() -> None:
             args.max_len,
             args.batch_size,
             include_confidence=True,
+            desc="Validation confidence inference",
         )
         baseline_predictions = [
             filter_prediction_by_field_thresholds(pred, {}, threshold)
@@ -601,7 +698,7 @@ def main() -> None:
         ]
         field_tuning_diagnostics["candidate_floor"] = field_candidates[0]
         field_tuning_diagnostics["exact_before_field_tuning"] = exact_accuracy(
-            tune_rows, baseline_predictions
+            tune_rows, baseline_predictions, normalize_boundaries
         )
         field_thresholds, tuned = tune_field_thresholds(
             tune_rows,
@@ -609,6 +706,7 @@ def main() -> None:
             sorted(descriptions.get("deal", {})),
             field_candidates,
             threshold,
+            normalize_boundaries,
         )
         field_tuning_diagnostics.update(tuned)
         print(
@@ -631,6 +729,7 @@ def main() -> None:
             args.max_len,
             args.batch_size,
             include_confidence=True,
+            desc="Test confidence inference",
         )
         preds = [
             filter_prediction_by_field_thresholds(
@@ -640,12 +739,20 @@ def main() -> None:
         ]
     else:
         preds = run_inference(
-            model, rows, schema, threshold, args.max_len, args.batch_size
+            model,
+            rows,
+            schema,
+            threshold,
+            args.max_len,
+            args.batch_size,
+            desc="Test inference",
         )
 
     for row, pred in zip(rows, preds):
         gold_deals = deals_from_gold_output(row["output"])
-        pred_deals = deals_from_prediction(pred)
+        pred_deals = deals_from_prediction(
+            pred, normalize_boundaries=normalize_boundaries
+        )
         ok = sentence_exact_match(gold_deals, pred_deals)
         n_correct += int(ok)
         tp, fp, fn = field_level_scores(gold_deals, pred_deals)
@@ -690,6 +797,7 @@ def main() -> None:
         "field_micro_recall": recall,
         "field_micro_f1": f1,
         "threshold": threshold,
+        "boundary_normalization": normalize_boundaries,
         "validation_threshold_scores": tuning_scores,
         "field_thresholds": field_thresholds,
         "field_threshold_tuning": field_tuning_diagnostics,
