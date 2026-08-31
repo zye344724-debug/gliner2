@@ -44,6 +44,8 @@ BATCH_SIZE=2 GRAD_ACCUM=8 PRECISION=fp16 bash test/run_full_server.sh
 - `structure_train_balanced_clean.jsonl`：完整主任务数据，加难字段族的小 schema 聚焦视图。
 - `ner_train_balanced_clean.jsonl`：对应的全字段 NER 预热数据。
 
+启用 `--split-multi` 时，训练 split 中可可靠拆分的 2～5 笔成交原句会同时作为多成交辅助样本保留，用于学习成交笔数和同一句内字段配对；验证与测试只保留原有独立样本，且不会引入其他 split 的同源原句。
+
 聚焦视图按八个业务字段族组织：债券标识、价格收益率、结算、交易双方、人员、发送关系、账户与代码、工作流。买卖方向、发送方向、桥机构、双方结算、双方账户、双方交易员和不同收益率类型即使不属于低频字段，也会进入聚焦训练。
 
 重复次数采用有上限的逆平方根策略。它能提高稀有字段的优化器曝光，又不会把只有 1～4 条的字段扩成大量机械副本。对全库只有极少真实标注的字段，训练脚本会保留并报告，但模型质量仍需要新增真实标注才能可靠保证。
@@ -83,4 +85,4 @@ BATCH_SIZE=2 GRAD_ACCUM=8 PRECISION=fp16 bash test/run_full_server.sh
 test/outputs/structure/full_server/eval_sentence_acc.json
 ```
 
-评测文件包含完整字段的句级严格准确率、Micro 指标、逐字段 support/precision/recall/F1，以及测试集是否具备 76 字段正例覆盖的声明。
+评测先在完整验证集上从一次置信度推理中学习逐字段阈值，再应用到测试集。结果文件包含完整字段的句级严格准确率、Micro 指标、逐字段 support/precision/recall/F1、逐字段阈值、逐句错误字段与 gold/pred，以及测试集是否具备 76 字段正例覆盖的声明。

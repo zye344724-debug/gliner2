@@ -56,6 +56,7 @@ Invoke-SmokeStep -Name "dependency and RTX 4060 probe" -Arguments @("-c", $Depen
 Invoke-SmokeStep -Name "prepare coverage-balanced 76-field smoke data" -Arguments @(
     (Join-Path $TestDir "prepare_data.py"), "--schema-mode", "full",
     "--split-multi", "--variant", $Variant, "--max-samples", "500",
+    "--retain-train-multi-max-deals", "5",
     "--focus-training", "--rare-field-target", "32", "--focus-max-repeats", "1"
 )
 Invoke-SmokeStep -Name "validate smoke data spans" -Arguments @(
@@ -109,7 +110,8 @@ Invoke-SmokeStep -Name "full-schema inference smoke" -Arguments @(
     (Join-Path $TestDir "evaluate_sentence_acc.py"), "--schema-mode", "full",
     "--data-variant", $Variant, "--model-dir", $FinalOut,
     "--max-len", "192", "--batch-size", "1", "--limit", "8",
-    "--tune-thresholds", "0.45", "--tune-limit", "8",
+    "--threshold", "0.55", "--tune-field-thresholds", "0.35,0.55,0.75",
+    "--tune-limit", "8",
     "--out", (Join-Path $FinalOut "eval_sentence_acc.json")
 )
 

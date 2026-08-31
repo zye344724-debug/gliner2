@@ -252,6 +252,159 @@ def build_structure_schema(descriptions: Dict[str, Dict[str, str]], list_fields:
     return {"deal": fields}
 
 
+def _filter_confident_value(value: Any, threshold: float) -> Any:
+    """Drop confidence-bearing values below a field-specific threshold."""
+    if isinstance(value, list):
+        kept = [_filter_confident_value(item, threshold) for item in value]
+        return [item for item in kept if item not in (None, "", [], ())]
+    if isinstance(value, dict):
+        confidence = value.get("confidence")
+        if confidence is not None and float(confidence) < threshold:
+            return None
+        return dict(value)
+    return value
+
+
+def filter_prediction_by_field_thresholds(
+    prediction: Any,
+    thresholds: Dict[str, float],
+    default_threshold: float,
+) -> Any:
+    """Apply per-field thresholds to formatted confidence predictions."""
+    if isinstance(prediction, list):
+        return [
+            filter_prediction_by_field_thresholds(item, thresholds, default_threshold)
+            for item in prediction
+        ]
+    if not isinstance(prediction, dict):
+        return prediction
+
+    def filter_deal(deal: Any) -> Any:
+        if not isinstance(deal, dict):
+            return deal
+        return {
+            field: _filter_confident_value(
+                value, thresholds.get(field, default_threshold)
+            )
+            for field, value in deal.items()
+        }
+
+    result = dict(prediction)
+    if isinstance(result.get("deal"), list):
+        result["deal"] = [filter_deal(deal) for deal in result["deal"]]
+    if isinstance(result.get("json_structures"), list):
+        structures = []
+        for item in result["json_structures"]:
+            if isinstance(item, dict) and "deal" in item:
+                copied = dict(item)
+                copied["deal"] = filter_deal(item["deal"])
+                structures.append(copied)
+            else:
+                structures.append(item)
+        result["json_structures"] = structures
+    return result
+
+
+def _field_metric(rows, predictions, field: str) -> Dict[str, float]:
+    counts: Counter = Counter()
+    for row, prediction in zip(rows, predictions):
+        gold = deals_from_gold_output(row["output"])
+        pred = deals_from_prediction(prediction)
+        counts.update(per_field_scores(gold, pred).get(field, {}))
+    tp, fp, fn = counts["tp"], counts["fp"], counts["fn"]
+    precision = tp / (tp + fp) if tp + fp else 0.0
+    recall = tp / (tp + fn) if tp + fn else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    return {
+        "support": tp + fn,
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+    }
+
+
+def tune_field_thresholds(
+    rows,
+    confidence_predictions,
+    fields,
+    candidates,
+    default_threshold,
+):
+    """Tune thresholds on validation without repeating model inference.
+
+    First maximize each field's validation F1, then keep only coordinate changes
+    that improve strict sentence exact match. All operations use cached
+    confidence-bearing predictions produced at the lowest candidate threshold.
+    """
+    thresholds = {field: default_threshold for field in fields}
+    diagnostics: Dict[str, Any] = {"field_scores": {}}
+    for field in fields:
+        scores = {}
+        for candidate in candidates:
+            trial = dict(thresholds)
+            trial[field] = candidate
+            filtered = [
+                filter_prediction_by_field_thresholds(
+                    prediction, trial, default_threshold
+                )
+                for prediction in confidence_predictions
+            ]
+            scores[str(candidate)] = _field_metric(rows, filtered, field)
+        support = max((metric["support"] for metric in scores.values()), default=0)
+        if support:
+            chosen = max(
+                candidates,
+                key=lambda candidate: (
+                    scores[str(candidate)]["f1"],
+                    scores[str(candidate)]["precision"],
+                    -abs(candidate - default_threshold),
+                ),
+            )
+        else:
+            # With no validation positives, suppress false positives.
+            chosen = max(
+                candidates,
+                key=lambda candidate: (-scores[str(candidate)]["fp"], candidate),
+            )
+        thresholds[field] = chosen
+        diagnostics["field_scores"][field] = {
+            "selected": chosen,
+            "candidates": scores,
+        }
+
+    filtered = [
+        filter_prediction_by_field_thresholds(pred, thresholds, default_threshold)
+        for pred in confidence_predictions
+    ]
+    current_exact = exact_accuracy(rows, filtered)
+    diagnostics["exact_after_field_f1_tuning"] = current_exact
+    # One cheap coordinate pass aligns field-F1 choices with the business metric.
+    for field in fields:
+        current = thresholds[field]
+        best, best_exact = current, current_exact
+        for candidate in candidates:
+            if candidate == current:
+                continue
+            trial = dict(thresholds)
+            trial[field] = candidate
+            trial_predictions = [
+                filter_prediction_by_field_thresholds(
+                    prediction, trial, default_threshold
+                )
+                for prediction in confidence_predictions
+            ]
+            score = exact_accuracy(rows, trial_predictions)
+            if score > best_exact:
+                best, best_exact = candidate, score
+        thresholds[field] = best
+        current_exact = best_exact
+    diagnostics["exact_after_coordinate_tuning"] = current_exact
+    return thresholds, diagnostics
+
+
 def resolve_model_dir(path: Optional[Path], data_variant: str) -> Path:
     if path is not None:
         root = Path(path)
@@ -288,6 +441,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--test-file", type=Path, default=None)
     p.add_argument("--threshold", type=float, default=0.5)
     p.add_argument("--tune-thresholds", default="")
+    p.add_argument(
+        "--tune-field-thresholds",
+        default="",
+        help=(
+            "Comma-separated per-field thresholds. Runs inference once at the "
+            "lowest candidate and tunes on validation only"
+        ),
+    )
     p.add_argument("--tune-file", type=Path, default=None)
     p.add_argument("--tune-limit", type=int, default=300)
     p.add_argument("--max-len", type=int, default=cfg.MAX_LEN)
@@ -307,7 +468,9 @@ def load_rows(path: Path, limit: int = -1) -> List[Dict[str, Any]]:
     return rows
 
 
-def run_inference(model, rows, schema, threshold, max_len, batch_size):
+def run_inference(
+    model, rows, schema, threshold, max_len, batch_size, include_confidence=False
+):
     texts = [r["input"] for r in rows]
     preds = []
     bs = max(1, batch_size)
@@ -315,11 +478,22 @@ def run_inference(model, rows, schema, threshold, max_len, batch_size):
         chunk = texts[i : i + bs]
         if hasattr(model, "batch_extract_json"):
             chunk_preds = model.batch_extract_json(
-                chunk, schema, batch_size=bs, threshold=threshold, max_len=max_len
+                chunk,
+                schema,
+                batch_size=bs,
+                threshold=threshold,
+                max_len=max_len,
+                include_confidence=include_confidence,
             )
         else:
             chunk_preds = [
-                model.extract_json(t, schema, threshold=threshold, max_len=max_len)
+                model.extract_json(
+                    t,
+                    schema,
+                    threshold=threshold,
+                    max_len=max_len,
+                    include_confidence=include_confidence,
+                )
                 for t in chunk
             ]
         preds.extend(chunk_preds)
@@ -379,6 +553,7 @@ def main() -> None:
 
     threshold = args.threshold
     tuning_scores = {}
+    tune_rows = None
     if args.tune_thresholds.strip():
         tune_file = args.tune_file or (data_dir / "structure_val_clean.jsonl")
         tune_rows = load_rows(tune_file, args.tune_limit)
@@ -397,12 +572,76 @@ def main() -> None:
         )
         print(f"selected threshold={threshold:.3f}")
 
+    field_thresholds: Dict[str, float] = {}
+    field_tuning_diagnostics: Dict[str, Any] = {}
+    field_candidates = [
+        float(value.strip())
+        for value in args.tune_field_thresholds.split(",")
+        if value.strip()
+    ]
+    if field_candidates:
+        if any(not 0.0 < candidate < 1.0 for candidate in field_candidates):
+            raise ValueError("--tune-field-thresholds values must be in (0, 1)")
+        field_candidates = sorted(set(field_candidates))
+        if tune_rows is None:
+            tune_file = args.tune_file or (data_dir / "structure_val_clean.jsonl")
+            tune_rows = load_rows(tune_file, args.tune_limit)
+        confidence_predictions = run_inference(
+            model,
+            tune_rows,
+            schema,
+            field_candidates[0],
+            args.max_len,
+            args.batch_size,
+            include_confidence=True,
+        )
+        baseline_predictions = [
+            filter_prediction_by_field_thresholds(pred, {}, threshold)
+            for pred in confidence_predictions
+        ]
+        field_tuning_diagnostics["candidate_floor"] = field_candidates[0]
+        field_tuning_diagnostics["exact_before_field_tuning"] = exact_accuracy(
+            tune_rows, baseline_predictions
+        )
+        field_thresholds, tuned = tune_field_thresholds(
+            tune_rows,
+            confidence_predictions,
+            sorted(descriptions.get("deal", {})),
+            field_candidates,
+            threshold,
+        )
+        field_tuning_diagnostics.update(tuned)
+        print(
+            "field threshold tuning exact: "
+            f"{field_tuning_diagnostics['exact_before_field_tuning']:.4f} -> "
+            f"{field_tuning_diagnostics['exact_after_coordinate_tuning']:.4f}"
+        )
+
     n_correct = 0
     field_tp = field_fp = field_fn = 0
     details = []
     field_counts: Dict[str, Counter] = defaultdict(Counter)
 
-    preds = run_inference(model, rows, schema, threshold, args.max_len, args.batch_size)
+    if field_thresholds:
+        raw_preds = run_inference(
+            model,
+            rows,
+            schema,
+            min(field_candidates),
+            args.max_len,
+            args.batch_size,
+            include_confidence=True,
+        )
+        preds = [
+            filter_prediction_by_field_thresholds(
+                prediction, field_thresholds, threshold
+            )
+            for prediction in raw_preds
+        ]
+    else:
+        preds = run_inference(
+            model, rows, schema, threshold, args.max_len, args.batch_size
+        )
 
     for row, pred in zip(rows, preds):
         gold_deals = deals_from_gold_output(row["output"])
@@ -413,14 +652,23 @@ def main() -> None:
         field_tp += tp
         field_fp += fp
         field_fn += fn
-        for field, counts in per_field_scores(gold_deals, pred_deals).items():
+        row_field_counts = per_field_scores(gold_deals, pred_deals)
+        for field, counts in row_field_counts.items():
             field_counts[field].update(counts)
+        error_fields = {
+            field: dict(counts)
+            for field, counts in sorted(row_field_counts.items())
+            if counts["fp"] or counts["fn"]
+        }
         details.append(
             {
-                "input": row["input"][:200],
+                "input": row["input"],
                 "exact": ok,
                 "n_gold_deals": len(gold_deals),
                 "n_pred_deals": len(pred_deals),
+                "error_fields": error_fields,
+                "gold_deals": [dict(deal) for deal in gold_deals],
+                "pred_deals": [dict(deal) for deal in pred_deals],
             }
         )
 
@@ -443,6 +691,8 @@ def main() -> None:
         "field_micro_f1": f1,
         "threshold": threshold,
         "validation_threshold_scores": tuning_scores,
+        "field_thresholds": field_thresholds,
+        "field_threshold_tuning": field_tuning_diagnostics,
         "schema_mode": args.schema_mode,
         "data_variant": data_variant,
         "business_full_field_evaluation": args.schema_mode == "full",

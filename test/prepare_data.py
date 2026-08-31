@@ -751,6 +751,15 @@ def main() -> None:
         help="Split multi-deal sentences into single-deal sub-samples",
     )
     parser.add_argument(
+        "--retain-train-multi-max-deals",
+        type=int,
+        default=0,
+        help=(
+            "When --split-multi is active, also retain provenance-safe original "
+            "multi-deal rows with 2..N deals in training only (0=disabled)"
+        ),
+    )
+    parser.add_argument(
         "--focus-training",
         action="store_true",
         help=(
@@ -776,6 +785,10 @@ def main() -> None:
         parser.error("--focus-training requires --schema-mode full")
     if args.rare_field_target <= 0 or args.focus_max_repeats <= 0:
         parser.error("focus target and repeat cap must be positive")
+    if args.retain_train_multi_max_deals < 0:
+        parser.error("--retain-train-multi-max-deals must be >= 0")
+    if args.retain_train_multi_max_deals and not args.split_multi:
+        parser.error("--retain-train-multi-max-deals requires --split-multi")
 
     variant = args.variant
     if variant is None and args.split_multi and args.schema_mode == "full":
@@ -818,10 +831,19 @@ def main() -> None:
     if args.schema_mode == "full":
         field_contract = validate_full_schema(samples, descriptions)
 
+    train_multi_candidates: List[Dict[str, Any]] = []
     if args.split_multi:
         expanded: List[Dict[str, Any]] = []
         for s in samples:
-            expanded.extend(split_multi_deal(s))
+            pieces = split_multi_deal(s)
+            expanded.extend(pieces)
+            n_deals = len(s.get("output", {}).get("json_structures", []))
+            if (
+                args.retain_train_multi_max_deals >= 2
+                and len(pieces) > 1
+                and 2 <= n_deals <= args.retain_train_multi_max_deals
+            ):
+                train_multi_candidates.append(s)
         samples = expanded
 
     groups = build_groups(samples)
@@ -838,6 +860,20 @@ def main() -> None:
             test_idx,
             set(descriptions.get("deal", {})),
         )
+
+    # Reintroduce only multi-deal parents whose split children belong to train.
+    # The shared fingerprint stem guarantees the parent cannot originate from a
+    # validation/test provenance component. Evaluation remains untouched.
+    train_stems = {
+        str(samples[index].get("fingerprint") or "").split("#")[0]
+        for index in train_idx
+    }
+    train_multi_aux = [
+        sample
+        for sample in train_multi_candidates
+        if str(sample.get("fingerprint") or "").split("#")[0] in train_stems
+    ]
+    train_multi_aux_ids = {id(sample) for sample in train_multi_aux}
 
     out_dir = args.out_dir / variant
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -856,17 +892,32 @@ def main() -> None:
         "source_field_contract": source_field_contract,
         "field_contract": field_contract,
         "train_coverage_adjustment": coverage_adjustment,
+        "train_multi_aux": {
+            "max_deals": args.retain_train_multi_max_deals,
+            "n_samples": len(train_multi_aux),
+            "n_deals": sum(
+                len(sample.get("output", {}).get("json_structures", []))
+                for sample in train_multi_aux
+            ),
+            "deal_count_distribution": dict(sorted(Counter(
+                len(sample.get("output", {}).get("json_structures", []))
+                for sample in train_multi_aux
+            ).items())),
+        },
         "splits": {},
     }
 
     for split_name, indices in split_map.items():
+        split_samples = [samples[i] for i in indices]
+        if split_name == "train":
+            split_samples.extend(train_multi_aux)
         ner_rows = [
-            ner_record(samples[i], descriptions, keep_fields=keep_fields)
-            for i in indices
+            ner_record(sample, descriptions, keep_fields=keep_fields)
+            for sample in split_samples
         ]
         struct_rows = [
-            structure_record(samples[i], descriptions, keep_fields=keep_fields)
-            for i in indices
+            structure_record(sample, descriptions, keep_fields=keep_fields)
+            for sample in split_samples
         ]
         # Drop empty structures (should be rare)
         struct_rows = [r for r in struct_rows if r["output"]["json_structures"]]
@@ -879,11 +930,12 @@ def main() -> None:
             out_dir / f"meta_{split_name}.jsonl",
             [
                 {
-                    "fingerprint": samples[i].get("fingerprint"),
-                    "input": samples[i]["input"],
-                    "n_deals": len(samples[i]["output"].get("json_structures", [])),
+                    "fingerprint": sample.get("fingerprint"),
+                    "input": sample["input"],
+                    "n_deals": len(sample["output"].get("json_structures", [])),
+                    "train_multi_aux": id(sample) in train_multi_aux_ids,
                 }
-                for i in indices
+                for sample in split_samples
             ],
         )
         stats["splits"][split_name] = {
@@ -895,6 +947,7 @@ def main() -> None:
             ),
             "n_ner_rows": n_ner,
             "n_structure_rows": n_st,
+            "n_train_multi_aux_rows": len(train_multi_aux) if split_name == "train" else 0,
         }
 
     # Official-format training files without meta (cleaner for trainer)
@@ -929,6 +982,14 @@ def main() -> None:
             structure_record(samples[i], descriptions, keep_fields=keep_fields)
             for i in train_idx
         ]
+        base_ner.extend(
+            ner_record(sample, descriptions, keep_fields=keep_fields)
+            for sample in train_multi_aux
+        )
+        base_structure.extend(
+            structure_record(sample, descriptions, keep_fields=keep_fields)
+            for sample in train_multi_aux
+        )
         base_ner = [row for row in base_ner if row["output"]["entities"]]
         base_structure = [
             row for row in base_structure if row["output"]["json_structures"]

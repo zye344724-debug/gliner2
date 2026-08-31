@@ -62,6 +62,7 @@ run_step environment "${PYTHON_BIN}" -c \
 run_step prepare_full_focus \
   "${PYTHON_BIN}" "${TEST_DIR}/prepare_data.py" \
   --schema-mode full --variant "${VARIANT}" --split-multi \
+  --retain-train-multi-max-deals 5 \
   --focus-training --rare-field-target "${RARE_FIELD_TARGET}" \
   --focus-max-repeats "${FOCUS_MAX_REPEATS}"
 
@@ -109,7 +110,9 @@ run_step evaluate_full_76_fields \
   "${PYTHON_BIN}" "${TEST_DIR}/evaluate_sentence_acc.py" \
   --schema-mode full --data-variant "${VARIANT}" --model-dir "${FINAL_OUT}" \
   --max-len "${MAX_LEN}" --batch-size "${EVAL_BATCH_SIZE}" \
-  --tune-thresholds 0.25,0.35,0.45,0.55,0.65,0.75 --tune-limit 500 \
+  --threshold 0.55 \
+  --tune-field-thresholds 0.15,0.25,0.35,0.45,0.55,0.65,0.75,0.85 \
+  --tune-limit -1 \
   --out "${FINAL_OUT}/eval_sentence_acc.json"
 
 echo

@@ -187,6 +187,7 @@ python test/prepare_data.py \
   --schema-mode full \
   --variant full_server \
   --split-multi \
+  --retain-train-multi-max-deals 5 \
   --focus-training \
   --rare-field-target 800 \
   --focus-max-repeats 4

@@ -100,6 +100,58 @@ def test_per_field_scores_count_wrong_value_as_fp_and_fn():
     assert scores["bond_code"] == {"fp": 1, "fn": 1}
 
 
+def test_per_field_threshold_tuning_uses_cached_confidences():
+    evaluate = load_script("evaluate_sentence_acc")
+    rows = [
+        {
+            "output": {
+                "json_structures": [
+                    {"deal": {"bond_code": "A", "buyer": "机构甲"}}
+                ]
+            }
+        },
+        {
+            "output": {
+                "json_structures": [{"deal": {"bond_code": "B"}}]
+            }
+        },
+    ]
+    predictions = [
+        {
+            "deal": [
+                {
+                    "bond_code": {"text": "A", "confidence": 0.4},
+                    "buyer": {"text": "机构甲", "confidence": 0.9},
+                }
+            ]
+        },
+        {
+            "deal": [
+                {
+                    "bond_code": {"text": "B", "confidence": 0.4},
+                    "buyer": {"text": "错误机构", "confidence": 0.2},
+                }
+            ]
+        },
+    ]
+
+    thresholds, diagnostics = evaluate.tune_field_thresholds(
+        rows,
+        predictions,
+        ["bond_code", "buyer"],
+        [0.3, 0.5, 0.7],
+        0.5,
+    )
+    filtered = [
+        evaluate.filter_prediction_by_field_thresholds(pred, thresholds, 0.5)
+        for pred in predictions
+    ]
+
+    assert thresholds["bond_code"] == 0.3
+    assert evaluate.exact_accuracy(rows, filtered) == 1.0
+    assert diagnostics["exact_after_coordinate_tuning"] == 1.0
+
+
 def test_training_contract_rejects_missing_field_labels(tmp_path):
     contract = load_script("field_contract")
     path = tmp_path / "ner.jsonl"

@@ -131,7 +131,7 @@ HARD_FIELDS = {
     "send_to", "send_from", "send_to_trader", "send_from_trader",
     "buyer_account", "seller_account", "buyer_trader_name",
     "seller_trader_name", "bridge_trader_name", "call_yield",
-    "maturity_yield", "buyer_fee", "seller_fee",
+    "maturity_yield", "net_price", "buyer_fee", "seller_fee",
 }
 
 # Stable deal-identifying context included in every focused structure view.

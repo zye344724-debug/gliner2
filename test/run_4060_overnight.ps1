@@ -3,7 +3,7 @@ param(
     [int]$RawSamples = 4000,
     [int]$NerEpochs = 1,
     [int]$FocusStructureEpochs = 2,
-    [int]$CalibrationEpochs = 1,
+    [int]$CalibrationEpochs = 2,
     [int]$RareFieldTarget = 200,
     [int]$FocusMaxRepeats = 2
 )
@@ -13,7 +13,7 @@ param(
 $ErrorActionPreference = "Continue"
 $TestDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $PackageDir = Split-Path -Parent $TestDir
-$Variant = "full_4060_6h"
+$Variant = "full_4060_v2"
 $DataDir = Join-Path $TestDir "data\$Variant"
 $NerOut = Join-Path $TestDir "outputs\ner\$Variant"
 $FocusOut = Join-Path $TestDir "outputs\structure\${Variant}_focus"
@@ -59,12 +59,13 @@ Invoke-Step -Name "check dependencies and CUDA" -Arguments @("-c", "import sys, 
 Invoke-Step -Name "prepare 6-hour full-field focus data" -Arguments @(
     (Join-Path $TestDir "prepare_data.py"), "--schema-mode", "full",
     "--split-multi", "--variant", $Variant, "--max-samples", "$RawSamples",
+    "--retain-train-multi-max-deals", "5",
     "--focus-training", "--rare-field-target", "$RareFieldTarget",
     "--focus-max-repeats", "$FocusMaxRepeats"
 )
 Invoke-Step -Name "validate prepared data" -Arguments @(
     (Join-Path $TestDir "validate_data.py"), "--data-dirs", $DataDir,
-    "--out", (Join-Path $TestDir "logs\validate_full_4060_6h.json")
+    "--out", (Join-Path $TestDir "logs\validate_full_4060_v2.json")
 )
 
 $Common = @(
@@ -96,8 +97,9 @@ Invoke-Step -Name "stage 3 - full-schema calibration" -Arguments (@(
 Invoke-Step -Name "test sentence exact match" -Arguments @(
     (Join-Path $TestDir "evaluate_sentence_acc.py"), "--schema-mode", "full",
     "--data-variant", $Variant, "--model-dir", $StructureOut,
-    "--max-len", "256", "--batch-size", "2",
-    "--tune-thresholds", "0.35,0.45,0.55,0.65", "--tune-limit", "200",
+    "--max-len", "256", "--batch-size", "2", "--threshold", "0.55",
+    "--tune-field-thresholds", "0.15,0.25,0.35,0.45,0.55,0.65,0.75,0.85",
+    "--tune-limit", "-1",
     "--out", (Join-Path $StructureOut "eval_sentence_acc.json")
 )
 
